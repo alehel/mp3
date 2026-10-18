@@ -28,17 +28,13 @@ Write correct frames whose granules carry zero spectral data.
   delay). Add an integration test that runs `ffmpeg -v error` on the output if
   ffmpeg is available.
 
-## M2: Analysis filterbank and MDCT (long blocks only)
+## M2: Analysis filterbank and MDCT (long blocks only) ✅
 
 - 32-band polyphase analysis filterbank (§2.4.3.2, Annex C.1.3). Analysis
   window coefficients come from the standard's table.
 - 18-point MDCT with the long-block window (§2.4.3.4), producing 576 lines per
   granule.
 - Alias-reduction butterflies (encoder side, matching the decoder's §2.4.3.4.10).
-- **Status:** long-block MDCT with frequency inversion done and TDAC-tested.
-  The filterbank and alias reduction wait on Annex C Table 3-C.1 (analysis
-  window) and Annex B Table 3-B.9 (alias coefficients). The project's copy
-  of the standard (a Committee Draft) has no annexes.
 - **Tests:** compare the filterbank against a direct (slow) evaluation of the
   matrixing formula. Implement a test-only IMDCT and verify TDAC perfect
   reconstruction to within floating-point tolerance. Pure sines should land in

@@ -32,7 +32,7 @@ docs/PLAN.md          staged milestones with exit criteria
 docs/EVALUATION.md    corpus, metrics, scoreboard
 docs/LISTENING.md     human listening protocol
 docs/RESEARCH.md      landscape and allowed references
-src/                  the encoder (bitstream, header, side info, WAV I/O done; rest staged)
+src/                  the encoder (bitstream, header, side info, WAV I/O, hybrid filterbank done; rest staged)
 tests/                decoder round-trip tests (minimp3 always, ffmpeg if on PATH)
 eval/run_eval.py      objective eval harness (ffmpeg + optional ViSQOL, LAME baseline)
 eval/abx.py           blind ABX listening tool
@@ -47,7 +47,8 @@ deny.toml             cargo-deny config that rejects copyleft dependencies
 |---|---|
 | M0 Scaffolding: bit writer, WAV reader, frame header | done |
 | M1 Valid silent bitstream: side info, frame loop, decoder tests | done |
-| M2–M9 | see [`docs/PLAN.md`](docs/PLAN.md) |
+| M2 Hybrid filterbank: polyphase analysis, long-block MDCT, alias reduction | done |
+| M3–M9 | see [`docs/PLAN.md`](docs/PLAN.md) |
 
 ## Quick start
 

@@ -9,14 +9,12 @@
 //! Clean-room reminder: derive from the sources above only. Cite clauses in
 //! comments and log every source in PROVENANCE.md (CLEANROOM.md).
 //!
-//! Status: long blocks (`block_type` 0) only. Alias reduction is still
-//! missing: its coefficients are in Annex B Table 3-B.9, which the project's
-//! copy of the standard does not include.
+//! Status: long blocks (`block_type` 0) only.
 
 use std::f64::consts::PI;
 
-/// Polyphase subbands per granule.
-pub const SUBBANDS: usize = 32;
+use crate::filterbank::AnalysisFilterbank;
+pub use crate::filterbank::SUBBANDS;
 /// Subband samples per granule, and MDCT lines per subband (long blocks).
 pub const LINES: usize = 18;
 /// Frequency lines per granule.
@@ -49,6 +47,40 @@ fn mdct_matrix() -> Box<[[f32; N]; LINES]> {
             (4.0 / n * arg.cos()) as f32
         })
     }))
+}
+
+/// Alias-reduction coefficients `c_i`, 11172-3 Table 3-B.9.
+pub const ALIAS_CI: [f64; 8] = [
+    -0.6, -0.535, -0.33, -0.185, -0.095, -0.041, -0.0142, -0.0037,
+];
+
+/// Butterfly coefficients from Table 3-B.9:
+/// `cs_i = 1/√(1 + c_i²)`, `ca_i = c_i/√(1 + c_i²)`. Computed in f64.
+fn alias_coefficients() -> ([f32; 8], [f32; 8]) {
+    let norm = |c: f64| (1.0 + c * c).sqrt();
+    (
+        std::array::from_fn(|i| (1.0 / norm(ALIAS_CI[i])) as f32),
+        std::array::from_fn(|i| (ALIAS_CI[i] / norm(ALIAS_CI[i])) as f32),
+    )
+}
+
+/// Encoder alias reduction for a long-block granule, 11172-3 Annex C
+/// ("Aliasing-Butterfly, Encoder") with the layout of Figure 3-A.5: across
+/// each of the 31 subband boundaries, butterfly i (0..8) pairs
+/// `a = X[18·sb − 1 − i]` with `b = X[18·sb + i]` and computes
+/// `a' = a·cs_i + b·ca_i`, `b' = b·cs_i − a·ca_i`.
+///
+/// This is the inverse rotation of the decoder butterfly (Figure 3-A.6,
+/// `a' = a·cs − b·ca`, `b' = b·cs + a·ca`), since `cs² + ca² = 1`.
+pub fn alias_reduce(xr: &mut [f32; GRANULE_LINES], cs: &[f32; 8], ca: &[f32; 8]) {
+    for sb in 1..SUBBANDS {
+        for i in 0..8 {
+            let (lo, hi) = (LINES * sb - 1 - i, LINES * sb + i);
+            let (a, b) = (xr[lo], xr[hi]);
+            xr[lo] = a * cs[i] + b * ca[i];
+            xr[hi] = b * cs[i] - a * ca[i];
+        }
+    }
 }
 
 /// Per-channel MDCT state.
@@ -114,54 +146,61 @@ impl Mdct {
     }
 }
 
+/// PCM samples per granule.
+pub const GRANULE_SAMPLES: usize = GRANULE_LINES;
+
+/// The encoder's hybrid filterbank for one channel (long blocks): polyphase
+/// analysis (Annex C.1.3), MDCT (§2.4.3.4) and alias reduction (Annex C).
+///
+/// Through a conforming decoder the PCM comes back at unit gain, delayed by
+/// [`HybridFilterbank::DELAY`] samples (checked by `hybrid_round_trip`).
+#[derive(Debug, Clone)]
+pub struct HybridFilterbank {
+    analysis: AnalysisFilterbank,
+    mdct: Mdct,
+    cs: [f32; 8],
+    ca: [f32; 8],
+}
+
+impl Default for HybridFilterbank {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HybridFilterbank {
+    /// Encoder plus decoder delay in samples. original: measured with the
+    /// reference decoder in `hybrid_round_trip`. It splits as one granule
+    /// (576) for the MDCT overlap plus 481 for the analysis and synthesis
+    /// polyphase filters together.
+    pub const DELAY: usize = 1057;
+
+    pub fn new() -> Self {
+        let (cs, ca) = alias_coefficients();
+        Self {
+            analysis: AnalysisFilterbank::new(),
+            mdct: Mdct::new(),
+            cs,
+            ca,
+        }
+    }
+
+    /// Turn 576 PCM samples (oldest first) into 576 frequency lines.
+    pub fn granule(&mut self, pcm: &[f32; GRANULE_SAMPLES], out: &mut [f32; GRANULE_LINES]) {
+        let mut sub: SubbandGranule = [[0.0; SUBBANDS]; LINES];
+        for (row, chunk) in sub.iter_mut().zip(pcm.chunks_exact(SUBBANDS)) {
+            let input: &[f32; SUBBANDS] = chunk.try_into().expect("chunk of 32");
+            self.analysis.process(input, row);
+        }
+        self.mdct.granule(&sub, out);
+        alias_reduce(out, &self.cs, &self.ca);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Test-only decoder path for one subband: IMDCT exactly as written in
-    /// 11172-3 §2.4.3.4 (unscaled, f64), long window, overlap-add, then the
-    /// frequency inversion for odd subbands.
-    struct Imdct {
-        overlap: [[f64; LINES]; SUBBANDS],
-    }
-
-    impl Imdct {
-        fn new() -> Self {
-            Self {
-                overlap: [[0.0; LINES]; SUBBANDS],
-            }
-        }
-
-        fn granule(&mut self, lines: &[f32; GRANULE_LINES]) -> SubbandGranule {
-            let n = N as f64;
-            let mut out = [[0.0f32; SUBBANDS]; LINES];
-            for sb in 0..SUBBANDS {
-                let x = &lines[sb * LINES..(sb + 1) * LINES];
-                let z: Vec<f64> = (0..N)
-                    .map(|i| {
-                        let xi: f64 = (0..LINES)
-                            .map(|k| {
-                                let arg = PI / (2.0 * n)
-                                    * (2.0 * i as f64 + 1.0 + n / 2.0)
-                                    * (2.0 * k as f64 + 1.0);
-                                f64::from(x[k]) * arg.cos()
-                            })
-                            .sum();
-                        xi * (PI / 36.0 * (i as f64 + 0.5)).sin()
-                    })
-                    .collect();
-                for t in 0..LINES {
-                    let mut s = z[t] + self.overlap[sb][t];
-                    if sb % 2 == 1 && t % 2 == 1 {
-                        s = -s;
-                    }
-                    out[t][sb] = s as f32;
-                    self.overlap[sb][t] = z[t + LINES];
-                }
-            }
-            out
-        }
-    }
+    use crate::refdec::{HybridSynthesis, Imdct};
 
     /// Deterministic pseudo-random subband signal in [-1, 1).
     fn noise(seed: &mut u64) -> f32 {
@@ -193,7 +232,7 @@ mod tests {
             let input: SubbandGranule =
                 std::array::from_fn(|_| std::array::from_fn(|_| noise(&mut seed)));
             mdct.granule(&input, &mut lines);
-            let rec = imdct.granule(&lines);
+            let rec = imdct.granule(&lines.map(f64::from));
             // One granule of delay.
             if let Some(expect) = prev_input {
                 for t in 0..LINES {
@@ -270,6 +309,88 @@ mod tests {
     fn tones_land_on_expected_line() {
         for (sb, k) in [(0, 0), (0, 7), (3, 17), (10, 4), (31, 12), (31, 17)] {
             assert_eq!(peak_line(sb, k), sb * LINES + k, "sb={sb} k={k}");
+        }
+    }
+
+    #[test]
+    fn alias_butterflies_are_inverse_rotations() {
+        let (cs, ca) = alias_coefficients();
+        for i in 0..8 {
+            let r = f64::from(cs[i]).powi(2) + f64::from(ca[i]).powi(2);
+            assert!((r - 1.0).abs() < 1e-6, "i={i}");
+        }
+        // Encoder then reference-decoder butterflies restore the input.
+        let mut seed = 3;
+        let orig: [f32; GRANULE_LINES] = std::array::from_fn(|_| noise(&mut seed));
+        let mut xr = orig;
+        alias_reduce(&mut xr, &cs, &ca);
+        assert_ne!(xr, orig);
+        let mut back = xr.map(f64::from);
+        crate::refdec::alias_butterflies(&mut back);
+        for (b, o) in back.iter().zip(&orig) {
+            assert!((b - f64::from(*o)).abs() < 1e-6);
+        }
+        // Lines more than 8 away from any boundary are untouched.
+        for sb in 0..SUBBANDS {
+            for k in 8..10 {
+                assert_eq!(xr[sb * LINES + k], orig[sb * LINES + k]);
+            }
+        }
+    }
+
+    /// Encoder hybrid filterbank into the spec's decoder chain: PCM must come
+    /// back at unit gain after `DELAY` samples, limited only by the 16-bit
+    /// window coefficients (near-perfect reconstruction).
+    #[test]
+    fn hybrid_round_trip() {
+        let granules = 30;
+        let mut seed = 11;
+        let input: Vec<f32> = (0..granules * GRANULE_SAMPLES)
+            .map(|_| 0.5 * noise(&mut seed))
+            .collect();
+        let mut enc = HybridFilterbank::new();
+        let mut dec = HybridSynthesis::new();
+        let mut lines = [0.0f32; GRANULE_LINES];
+        let mut output = Vec::new();
+        for chunk in input.chunks_exact(GRANULE_SAMPLES) {
+            enc.granule(chunk.try_into().unwrap(), &mut lines);
+            output.extend(dec.granule(&lines));
+        }
+        let d = HybridFilterbank::DELAY;
+        // Skip the start-up transient of the filters.
+        let (mut sig, mut err) = (0.0f64, 0.0f64);
+        for n in 2 * GRANULE_SAMPLES..input.len() - d {
+            let x = f64::from(input[n]);
+            sig += x * x;
+            err += (output[n + d] - x).powi(2);
+        }
+        let snr = 10.0 * (sig / err).log10();
+        assert!(snr > 80.0, "round-trip SNR {snr:.1} dB");
+    }
+
+    #[test]
+    fn sine_lands_on_expected_line() {
+        // A PCM sine at the centre of line L = 18·sb + k sits at
+        // (L + 1/2) · fs/1152 (576 lines spanning 0..fs/2).
+        for line in [3usize, 40, 100, 301, 450] {
+            let w = (line as f64 + 0.5) * PI / GRANULE_LINES as f64;
+            let mut enc = HybridFilterbank::new();
+            let mut lines = [0.0f32; GRANULE_LINES];
+            let mut energy = [0.0f64; GRANULE_LINES];
+            for g in 0..12 {
+                let pcm: [f32; GRANULE_SAMPLES] =
+                    std::array::from_fn(|i| (w * (g * GRANULE_SAMPLES + i) as f64).sin() as f32);
+                enc.granule(&pcm, &mut lines);
+                if g >= 3 {
+                    for (e, &x) in energy.iter_mut().zip(&lines) {
+                        *e += f64::from(x) * f64::from(x);
+                    }
+                }
+            }
+            let peak = (0..GRANULE_LINES)
+                .max_by(|&a, &b| energy[a].total_cmp(&energy[b]))
+                .unwrap();
+            assert_eq!(peak, line);
         }
     }
 }

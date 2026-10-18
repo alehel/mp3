@@ -7,6 +7,8 @@
 
 pub mod bitstream;
 pub mod header;
+#[cfg(test)]
+mod refdec;
 pub mod sideinfo;
 pub mod wav;
 

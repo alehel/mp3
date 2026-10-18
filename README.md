@@ -32,7 +32,8 @@ docs/PLAN.md          staged milestones with exit criteria
 docs/EVALUATION.md    corpus, metrics, scoreboard
 docs/LISTENING.md     human listening protocol
 docs/RESEARCH.md      landscape and allowed references
-src/                  the encoder (bitstream, header and WAV I/O done; rest staged)
+src/                  the encoder (bitstream, header, side info, WAV I/O done; rest staged)
+tests/                decoder round-trip tests (minimp3 always, ffmpeg if on PATH)
 eval/run_eval.py      objective eval harness (ffmpeg + optional ViSQOL, LAME baseline)
 eval/abx.py           blind ABX listening tool
 corpus/               test audio (not committed, see corpus/README.md)
@@ -45,13 +46,14 @@ deny.toml             cargo-deny config that rejects copyleft dependencies
 | Milestone | State |
 |---|---|
 | M0 Scaffolding: bit writer, WAV reader, frame header | done |
-| M1–M9 | see [`docs/PLAN.md`](docs/PLAN.md) |
+| M1 Valid silent bitstream: side info, frame loop, decoder tests | done |
+| M2–M9 | see [`docs/PLAN.md`](docs/PLAN.md) |
 
 ## Quick start
 
 ```sh
 cargo test
-cargo run --release -- input.wav output.mp3 --bitrate 192   # errors until M3
+cargo run --release -- input.wav output.mp3 --bitrate 192   # silent output until M2/M3
 python3 eval/run_eval.py --corpus corpus/dev --bitrates 128 192 320 --keep out
 python3 eval/abx.py run --ref corpus/dev/castanets.wav --a out/castanets_ours_128.mp3 --trials 16
 ```

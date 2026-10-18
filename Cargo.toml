@@ -13,6 +13,8 @@ categories = ["multimedia::audio", "multimedia::encoding"]
 [dependencies]
 
 [dev-dependencies]
+# minimp3 (CC0) as a reference decoder in tests only. CLEANROOM.md §2 allows it.
+rmp3 = "0.3.1"
 
 [[bin]]
 name = "mp3enc"

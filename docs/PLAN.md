@@ -17,7 +17,7 @@ ISO/IEC 13818-3 (MPEG-2 LSF, 16/22.05/24 kHz). Section numbers below refer to
   writer with bitrate/sample-rate tables and frame-length calculation.
 - CI: fmt, clippy, test, cargo-deny.
 
-## M1: A valid, silent bitstream
+## M1: A valid, silent bitstream ✅
 
 Write correct frames whose granules carry zero spectral data.
 

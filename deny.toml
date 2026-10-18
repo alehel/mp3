@@ -1,0 +1,29 @@
+# cargo-deny configuration. Run: cargo deny check
+# Enforces CLEANROOM.md §5: no copyleft in the dependency graph.
+
+[licenses]
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "Unlicense",
+]
+confidence-threshold = 0.9
+# No exceptions. In particular, never add LGPL/GPL encoder bindings (mp3lame-sys,
+# shine-sys and the like). If you think you need one, open an issue first.
+exceptions = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

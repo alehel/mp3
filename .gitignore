@@ -1,0 +1,11 @@
+/target
+
+# Test audio is never committed (licensing and size). See corpus/README.md.
+/corpus/**/*.wav
+/corpus/**/*.flac
+/corpus/**/*.mp3
+
+# Encoded outputs and eval runs
+/out/
+/eval/results/*.json
+__pycache__/

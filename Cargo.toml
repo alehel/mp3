@@ -1,0 +1,24 @@
+[package]
+name = "mp3enc"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Clean-room MPEG-1/2 Audio Layer III (MP3) encoder"
+readme = "README.md"
+keywords = ["mp3", "audio", "encoder", "codec", "mpeg"]
+categories = ["multimedia::audio", "multimedia::encoding"]
+
+# Runtime dependencies must be permissively licensed. See CLEANROOM.md §5 and deny.toml.
+[dependencies]
+
+[dev-dependencies]
+
+[[bin]]
+name = "mp3enc"
+path = "src/bin/mp3enc.rs"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = 1 # keep symbols for profiling

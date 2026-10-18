@@ -53,6 +53,9 @@ Write correct frames whose granules carry zero spectral data.
   coefficient check (quantize → Huffman → decode tables → dequantize) passes.
 - 🎧 **Smoke listen:** one person, five minutes. It should sound like the input
   (noisy is fine). Log `smoke` sessions to `listening/log.csv`.
+- **Status:** implemented; objective exit met (ffmpeg and minimp3 decode all
+  test configurations at unit gain, 26–44 dB SNR on a synthetic test signal,
+  Huffman round trip exact). Waiting on the smoke listen.
 
 ## M4: Scalefactors and the outer loop
 

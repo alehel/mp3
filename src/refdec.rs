@@ -136,3 +136,117 @@ impl HybridSynthesis {
         sub.iter().flat_map(|row| self.synth.process(row)).collect()
     }
 }
+
+/// MSB-first bit reader over a byte slice.
+pub struct BitReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> BitReader<'a> {
+    pub fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
+    }
+
+    pub fn position(&self) -> usize {
+        self.pos
+    }
+
+    pub fn bit(&mut self) -> u32 {
+        let b = (self.data[self.pos / 8] >> (7 - self.pos % 8)) & 1;
+        self.pos += 1;
+        u32::from(b)
+    }
+
+    pub fn bits(&mut self, n: u32) -> u32 {
+        (0..n).fold(0, |acc, _| (acc << 1) | self.bit())
+    }
+}
+
+/// Side-information fields a decoder needs for long-block Huffman data.
+pub struct HuffmanSideInfo {
+    pub big_values: usize,
+    pub table_select: [usize; 3],
+    pub region0_count: usize,
+    pub region1_count: usize,
+    pub count1_table_b: bool,
+    /// part2_3_length minus part2_length.
+    pub part3_length: usize,
+}
+
+/// Read one Huffman symbol: extend the code bit by bit until it matches an
+/// entry (the tables are prefix-free). Returns the entry index.
+fn read_symbol(r: &mut BitReader, codes: &[(u8, u32)]) -> usize {
+    let (mut len, mut code) = (0u8, 0u32);
+    loop {
+        code = (code << 1) | r.bit();
+        len += 1;
+        if let Some(i) = codes.iter().position(|&(l, c)| l == len && c == code) {
+            return i;
+        }
+        assert!(len < 20, "no Huffman code matched");
+    }
+}
+
+/// Decode `huffmancodebits()` for a long-block granule (13818-3 §2.5.1):
+/// big_values pairs in three regions, then count1 quadruples until
+/// `part3_length` bits are used, rest zero. Written from the syntax and the
+/// Annex B tables, independently of `huffman::write`.
+pub fn decode_huffman(
+    r: &mut BitReader,
+    si: &HuffmanSideInfo,
+    region_bounds: &[usize],
+    pair_codes: impl Fn(usize) -> (&'static [(u8, u32)], usize, u32),
+    quad_codes: &[(u8, u32); 16],
+) -> [i32; GRANULE_LINES] {
+    let start = r.position();
+    let mut is = [0i32; GRANULE_LINES];
+    let last = region_bounds.len() - 1;
+    let bv_end = 2 * si.big_values;
+    let r1 = region_bounds[(si.region0_count + 1).min(last)].min(bv_end);
+    let r2 = region_bounds[(si.region0_count + si.region1_count + 2).min(last)].min(bv_end);
+    let mut l = 0;
+    while l < bv_end {
+        let table = si.table_select[if l < r1 {
+            0
+        } else if l < r2 {
+            1
+        } else {
+            2
+        }];
+        if table == 0 {
+            l += 2; // table 0: both values zero, no bits
+            continue;
+        }
+        let (codes, size, linbits) = pair_codes(table);
+        let idx = read_symbol(r, codes);
+        for v in [idx / size, idx % size] {
+            let mut mag = v as i32;
+            if linbits > 0 && mag == 15 {
+                mag += r.bits(linbits) as i32;
+            }
+            if mag != 0 && r.bit() == 1 {
+                mag = -mag;
+            }
+            is[l] = mag;
+            l += 1;
+        }
+    }
+    while r.position() - start < si.part3_length && l + 4 <= GRANULE_LINES {
+        let idx = read_symbol(r, quad_codes);
+        for k in 0..4 {
+            let mut v = ((idx >> (3 - k)) & 1) as i32;
+            if v != 0 && r.bit() == 1 {
+                v = -v;
+            }
+            is[l + k] = v;
+        }
+        l += 4;
+    }
+    assert_eq!(
+        r.position() - start,
+        si.part3_length,
+        "Huffman data overran part3_length"
+    );
+    is
+}

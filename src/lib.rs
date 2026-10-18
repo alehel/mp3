@@ -1,7 +1,9 @@
 //! Clean-room MPEG-1/2 Audio Layer III (MP3) encoder.
 //!
-//! Status: M1. [`Encoder`] writes valid frames whose granules carry no
-//! spectral data, so every stream decodes to silence. See `docs/PLAN.md`.
+//! Status: M3. [`Encoder`] runs the hybrid filterbank, quantizes each
+//! granule with a global gain chosen to fit the frame (no psychoacoustics,
+//! no scalefactors, no bit reservoir) and Huffman-codes it. See
+//! `docs/PLAN.md`.
 
 #![forbid(unsafe_code)]
 
@@ -22,8 +24,10 @@ pub mod reservoir;
 pub mod stereo;
 
 use bitstream::BitWriter;
-use header::{ChannelMode, FrameHeader, PaddingState, StreamParams};
-use sideinfo::SideInfo;
+use header::{ChannelMode, FrameHeader, PaddingState, StreamParams, Version};
+use mdct::{GRANULE_SAMPLES, HybridFilterbank};
+use quantize::{QuantizedGranule, ScalefactorBands};
+use sideinfo::{GranuleInfo, SideInfo, Window};
 
 /// Errors produced by the encoder and its I/O helpers.
 #[derive(Debug)]
@@ -126,6 +130,12 @@ pub struct Encoder {
     padding: PaddingState,
     /// Samples not yet coded, one buffer per coded channel (after any downmix).
     pending: Vec<Vec<f32>>,
+    /// One hybrid filterbank per coded channel.
+    filterbanks: Vec<HybridFilterbank>,
+    bands: ScalefactorBands,
+    /// Input samples per channel received so far, and samples coded.
+    samples_in: usize,
+    samples_coded: usize,
 }
 
 impl Encoder {
@@ -138,6 +148,13 @@ impl Encoder {
             RateControl::Vbr { .. } => return Err(Error::NotImplemented("VBR (M8)")),
         };
         let params = StreamParams::new(config.sample_rate, bitrate)?;
+        if params.version == Version::Mpeg25 {
+            return Err(Error::NotImplemented(
+                "MPEG-2.5 (no standard scalefactor band tables; optional in M8)",
+            ));
+        }
+        let bands = ScalefactorBands::long(config.sample_rate)
+            .ok_or(Error::UnsupportedSampleRate(config.sample_rate))?;
         let mode = match (config.channels, config.stereo) {
             (1, _) | (_, StereoMode::Mono) => ChannelMode::Mono,
             (_, StereoMode::Stereo) => ChannelMode::Stereo,
@@ -152,6 +169,10 @@ impl Encoder {
             mode,
             padding: PaddingState::new(&params),
             pending: vec![Vec::new(); mode.channels()],
+            filterbanks: vec![HybridFilterbank::new(); mode.channels()],
+            bands,
+            samples_in: 0,
+            samples_coded: 0,
         })
     }
 
@@ -188,50 +209,102 @@ impl Encoder {
             // Stereo input coded as mono: plain average of the two channels.
             self.pending[0].extend(pcm[0].iter().zip(pcm[1]).map(|(l, r)| 0.5 * (l + r)));
         }
+        self.samples_in += pcm[0].len();
+        Ok(self.drain_frames())
+    }
 
+    /// Code every whole frame of pending samples.
+    fn drain_frames(&mut self) -> Vec<u8> {
         let spf = self.params.version.samples_per_frame();
         let frames = self.pending[0].len() / spf;
         let mut out = Vec::with_capacity(frames * self.params.frame_bytes(true));
-        for _ in 0..frames {
-            self.write_frame(&mut out);
+        for f in 0..frames {
+            self.write_frame(f * spf, &mut out);
         }
         for buf in &mut self.pending {
             buf.drain(..frames * spf);
         }
-        Ok(out)
+        self.samples_coded += frames * spf;
+        out
     }
 
-    /// Flush buffered samples and return the final frames. A partial last
-    /// frame is zero-padded to a whole frame.
-    pub fn finish(mut self) -> Result<Vec<u8>, Error> {
-        let mut out = Vec::new();
-        if !self.pending[0].is_empty() {
-            let spf = self.params.version.samples_per_frame();
-            for buf in &mut self.pending {
-                buf.resize(spf, 0.0);
-            }
-            self.write_frame(&mut out);
-        }
-        Ok(out)
-    }
-
-    /// Append one frame coding the first `samples_per_frame` pending samples.
+    /// Flush and return the final frames.
     ///
-    /// M1: every granule is silent (`part2_3_length` = 0), `main_data_begin`
-    /// is 0 (no reservoir), and the rest of the frame after the side
-    /// information is zero-filled. A decoder treats the unused main-data bytes
-    /// as ancillary data (11172-3 §2.4.1.7, §2.4.2.7 `part2_3_length`).
-    fn write_frame(&mut self, out: &mut Vec<u8>) {
+    /// The filterbanks delay the signal by [`HybridFilterbank::DELAY`]
+    /// samples (encoder plus decoder), so zeros are appended until every
+    /// input sample has come out of a decoder. The decoded stream therefore
+    /// starts with that many samples of delay and ends with padding;
+    /// signalling them for gapless playback is M8.
+    pub fn finish(mut self) -> Result<Vec<u8>, Error> {
+        if self.samples_in == 0 {
+            return Ok(Vec::new());
+        }
+        let spf = self.params.version.samples_per_frame();
+        let target = (self.samples_in + HybridFilterbank::DELAY).div_ceil(spf) * spf;
+        let pad = target - self.samples_coded - self.pending[0].len();
+        for buf in &mut self.pending {
+            buf.resize(buf.len() + pad, 0.0);
+        }
+        Ok(self.drain_frames())
+    }
+
+    /// Append one frame coding `samples_per_frame` pending samples starting
+    /// at `offset`.
+    ///
+    /// M3: no bit reservoir (`main_data_begin` = 0), so each frame's main
+    /// data must fit in the frame itself. The space after the header and side
+    /// information is split evenly between granules and channels; unused
+    /// bits at the end are zero ancillary data (11172-3 §2.4.1.7).
+    fn write_frame(&mut self, offset: usize, out: &mut Vec<u8>) {
+        let version = self.params.version;
+        let channels = self.mode.channels();
         let header = FrameHeader::new(self.params, self.mode, self.padding.next_padding());
         let frame_bytes = header.frame_bytes();
+        let main_bits = (frame_bytes - 4 - self.params.side_info_bytes(channels)) * 8;
+        let slots = version.granules() * channels;
+        // part2_3_length is a 12-bit field.
+        let budget = ((main_bits / slots) as u32).min(4095);
+
+        let mut side = SideInfo::silent();
+        let mut coded: Vec<QuantizedGranule> = Vec::with_capacity(slots);
+        let mut xr = [0.0f32; quantize::GRANULE_LINES];
+        for gr in 0..version.granules() {
+            for ch in 0..channels {
+                let start = offset + gr * GRANULE_SAMPLES;
+                let pcm: &[f32; GRANULE_SAMPLES] = self.pending[ch][start..start + GRANULE_SAMPLES]
+                    .try_into()
+                    .expect("whole granule");
+                self.filterbanks[ch].granule(pcm, &mut xr);
+                let q = quantize::rate_loop(&xr, &self.bands, budget);
+                side.granules[gr][ch] = GranuleInfo {
+                    part2_3_length: q.plan.bits as u16,
+                    big_values: q.plan.big_values,
+                    global_gain: q.global_gain,
+                    scalefac_compress: 0,
+                    window: Window::Long {
+                        table_select: q.plan.table_select,
+                        region0_count: q.plan.region0_count,
+                        region1_count: q.plan.region1_count,
+                    },
+                    preflag: false,
+                    scalefac_scale: false,
+                    count1table_select: q.plan.count1_table_b,
+                };
+                coded.push(q);
+            }
+        }
+
         let mut w = BitWriter::with_capacity(frame_bytes);
         header.write(&mut w);
-        SideInfo::silent().write(self.params.version, self.mode.channels(), &mut w);
+        side.write(version, channels, &mut w);
+        debug_assert_eq!(w.bit_len(), (4 + self.params.side_info_bytes(channels)) * 8);
+        // Main data in syntax order: for each granule, for each channel,
+        // scalefactors (none yet: slen1 = slen2 = 0) then Huffman bits.
+        for q in &coded {
+            huffman::write(&mut w, &q.ix, &q.plan, &self.bands);
+        }
         let mut frame = w.into_bytes();
-        debug_assert_eq!(
-            frame.len(),
-            4 + self.params.side_info_bytes(self.mode.channels())
-        );
+        debug_assert!(frame.len() <= frame_bytes);
         frame.resize(frame_bytes, 0);
         out.extend_from_slice(&frame);
     }
@@ -249,6 +322,10 @@ mod tests {
             Err(Error::UnsupportedChannels(3))
         ));
         assert!(Encoder::new(EncoderConfig::cbr(44_100, 2, 100)).is_err());
+        assert!(matches!(
+            Encoder::new(EncoderConfig::cbr(11_025, 1, 32)),
+            Err(Error::NotImplemented(_))
+        ));
     }
 
     #[test]
@@ -293,7 +370,8 @@ mod tests {
         let params = *e.stream_params();
         mp3.extend(e.finish().unwrap());
         let lens = frame_lengths(&mp3, &params);
-        assert_eq!(lens.len(), 11);
+        // Flushing covers the filterbank delay: ceil((12000 + 1057) / 1152).
+        assert_eq!(lens.len(), 12);
         // At 128 kbps / 44.1 kHz, frames are 417 or 418 bytes (§2.4.2.3).
         assert!(lens.iter().all(|&l| l == 417 || l == 418));
     }

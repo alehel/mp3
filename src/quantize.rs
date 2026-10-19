@@ -743,7 +743,7 @@ mod tests {
                     let n = (g * GRANULE_SAMPLES + i) as f64;
                     amp * (2.0 * std::f64::consts::PI * f * n / 44_100.0).sin() as f32
                 });
-                fb.granule(&pcm, &mut xr);
+                fb.granule(&pcm, crate::mdct::Block::Normal, &mut xr);
                 if g >= 4 {
                     energy += xr.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>();
                 }

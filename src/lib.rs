@@ -25,7 +25,7 @@ pub mod stereo;
 
 use bitstream::BitWriter;
 use header::{ChannelMode, FrameHeader, PaddingState, StreamParams, Version};
-use mdct::{GRANULE_SAMPLES, HybridFilterbank};
+use mdct::{Block, GRANULE_SAMPLES, HybridFilterbank};
 use psy::PsyModel;
 use quantize::{Ath, CodedGranule, ScalefactorBands};
 use sideinfo::{GranuleInfo, SideInfo, Window};
@@ -316,7 +316,7 @@ impl Encoder {
                 let pcm: &[f32; GRANULE_SAMPLES] = self.pending[ch][start..start + GRANULE_SAMPLES]
                     .try_into()
                     .expect("whole granule");
-                self.filterbanks[ch].granule(pcm, &mut xr);
+                self.filterbanks[ch].granule(pcm, Block::Normal, &mut xr);
                 let xmin = if let Some(model) = self.psy.get_mut(ch) {
                     // Windows reach back before the granule into `history`.
                     let (hist, buf) = (&self.history[ch], &self.pending[ch]);

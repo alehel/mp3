@@ -656,7 +656,7 @@ mod tests {
         for g in 0..10 {
             let pcm: [f32; GRANULE_SAMPLES] =
                 std::array::from_fn(|i| sig((g * GRANULE_SAMPLES + i) as isize));
-            fb.granule(&pcm, &mut xr);
+            fb.granule(&pcm, crate::mdct::Block::Normal, &mut xr);
             energy.push(xr.iter().map(|v| v * v).sum::<f32>());
         }
         let mdct_jump = (1..10)

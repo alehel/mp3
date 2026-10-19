@@ -9,7 +9,8 @@
 //! Clean-room reminder: derive from the sources above only. Cite clauses in
 //! comments and log every source in PROVENANCE.md (CLEANROOM.md).
 //!
-//! Status: long blocks (`block_type` 0) only.
+//! Status: all four block types (normal, start, short, stop); no mixed
+//! blocks.
 
 use std::f64::consts::PI;
 
@@ -21,15 +22,75 @@ pub const LINES: usize = 18;
 pub const GRANULE_LINES: usize = SUBBANDS * LINES;
 /// Long-block MDCT length: 18 new samples plus 18 overlapped.
 const N: usize = 2 * LINES;
+/// Short-block MDCT length (three per granule).
+const NS: usize = 12;
+/// Lines per short window per subband, and per short window in total.
+pub const SHORT_LINES: usize = NS / 2;
+pub const SHORT_WINDOW_LINES: usize = SUBBANDS * SHORT_LINES;
+
+/// Window/transform type of a granule (`block_type`, 11172-3 §2.4.2.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Block {
+    #[default]
+    Normal,
+    /// Long-to-short transition.
+    Start,
+    /// Three short transforms. The 576 outputs are three 192-line spectra,
+    /// window-major: line `6·sb + m` of window `w` at `w·192 + 6·sb + m`.
+    Short,
+    /// Short-to-long transition.
+    Stop,
+}
 
 /// One granule of polyphase output, time-major: `[time][subband]`.
 pub type SubbandGranule = [[f32; SUBBANDS]; LINES];
 
-/// Long-block window (`block_type` 0), 11172-3 §2.4.3.4 "Windowing" a):
-/// `w_i = sin(π/36 · (i + 1/2))`. It satisfies the Princen–Bradley condition
-/// `w_i² + w_{i+18}² = 1`, which TDAC needs.
-fn long_window() -> [f32; N] {
-    std::array::from_fn(|i| (PI / N as f64 * (i as f64 + 0.5)).sin() as f32)
+/// Windows for the long transforms of each block type (11172-3 §2.4.3.4
+/// "Windowing"; the encoder uses the decoder's windows so the TDAC
+/// conditions hold across transitions):
+/// - normal (0): `sin(π/36 (i + ½))`, which satisfies the Princen–Bradley
+///   condition `w_i² + w_{i+18}² = 1`;
+/// - start (1): long rise for 0..18, 1 for 18..24, short fall
+///   `sin(π/12 (i − 18 + ½))` for 24..30, 0 for 30..36;
+/// - stop (3): 0 for 0..6, short rise `sin(π/12 (i − 6 + ½))` for 6..12,
+///   1 for 12..18, long fall for 18..36.
+fn block_window(block: Block) -> [f32; N] {
+    let long = |i: usize| (PI / 36.0 * (i as f64 + 0.5)).sin();
+    let short = |i: usize| (PI / 12.0 * (i as f64 + 0.5)).sin();
+    std::array::from_fn(|i| {
+        (match block {
+            Block::Normal | Block::Short => long(i),
+            Block::Start => match i {
+                0..18 => long(i),
+                18..24 => 1.0,
+                24..30 => short(i - 18),
+                _ => 0.0,
+            },
+            Block::Stop => match i {
+                0..6 => 0.0,
+                6..12 => short(i - 6),
+                12..18 => 1.0,
+                _ => long(i),
+            },
+        }) as f32
+    })
+}
+
+/// Short window, 11172-3 §2.4.3.4 "Windowing" d: `sin(π/12 (i + ½))`.
+fn short_window() -> [f32; NS] {
+    std::array::from_fn(|i| (PI / 12.0 * (i as f64 + 0.5)).sin() as f32)
+}
+
+/// Short MDCT matrix for n = 12: the same kernel and 4/n scaling as
+/// [`mdct_matrix`].
+fn short_matrix() -> [[f32; NS]; SHORT_LINES] {
+    let n = NS as f64;
+    std::array::from_fn(|k| {
+        std::array::from_fn(|i| {
+            let arg = PI / (2.0 * n) * (2.0 * i as f64 + 1.0 + n / 2.0) * (2.0 * k as f64 + 1.0);
+            (4.0 / n * arg.cos()) as f32
+        })
+    })
 }
 
 /// Forward MDCT matrix for n = 36, the transpose of the IMDCT kernel in
@@ -89,8 +150,11 @@ pub struct Mdct {
     /// Previous granule's subband samples (after frequency inversion),
     /// `[subband][time]`: the first half of the next 36-sample block.
     prev: [[f32; LINES]; SUBBANDS],
-    window: [f32; N],
+    /// Long windows for normal, start and stop blocks.
+    windows: [[f32; N]; 3],
+    short_window: [f32; NS],
     matrix: Box<[[f32; N]; LINES]>,
+    short_matrix: [[f32; NS]; SHORT_LINES],
 }
 
 impl Default for Mdct {
@@ -103,19 +167,26 @@ impl Mdct {
     pub fn new() -> Self {
         Self {
             prev: [[0.0; LINES]; SUBBANDS],
-            window: long_window(),
+            windows: [Block::Normal, Block::Start, Block::Stop].map(block_window),
+            short_window: short_window(),
             matrix: mdct_matrix(),
+            short_matrix: short_matrix(),
         }
     }
 
-    /// Transform one granule of subband samples into 576 frequency lines,
-    /// ordered as the decoder expects: line `18 · sb + k` (11172-3 §2.4.3.4,
-    /// "each 18 into one transform block").
+    /// Transform one granule of subband samples into 576 frequency lines.
+    /// Long blocks: line `18 · sb + k` (11172-3 §2.4.3.4, "each 18 into one
+    /// transform block"). Short blocks: see [`Block::Short`].
     ///
     /// The lines describe the 36-sample block ending with this granule, so a
     /// decoder reproduces the subband samples one granule (18 samples per
     /// subband) late.
-    pub fn granule(&mut self, input: &SubbandGranule, out: &mut [f32; GRANULE_LINES]) {
+    pub fn granule(
+        &mut self,
+        input: &SubbandGranule,
+        block: Block,
+        out: &mut [f32; GRANULE_LINES],
+    ) {
         for sb in 0..SUBBANDS {
             let mut cur: [f32; LINES] = std::array::from_fn(|t| input[t][sb]);
             // 11172-3 §2.4.3.4, "Synthesis filterbank": the decoder negates
@@ -129,17 +200,37 @@ impl Mdct {
                 }
             }
 
-            let block: [f32; N] = std::array::from_fn(|i| {
-                let x = if i < LINES {
+            let x = |i: usize| {
+                if i < LINES {
                     self.prev[sb][i]
                 } else {
                     cur[i - LINES]
-                };
-                x * self.window[i]
-            });
-            let lines = &mut out[sb * LINES..(sb + 1) * LINES];
-            for (line, row) in lines.iter_mut().zip(self.matrix.iter()) {
-                *line = row.iter().zip(&block).map(|(c, z)| c * z).sum();
+                }
+            };
+            if block == Block::Short {
+                // §2.4.3.4: the three short transforms cover samples 6..18,
+                // 12..24 and 18..30 of the 36-sample block (6 zeros at each
+                // end in the decoder's overlap).
+                for w in 0..3 {
+                    let z: [f32; NS] =
+                        std::array::from_fn(|i| x(6 + 6 * w + i) * self.short_window[i]);
+                    let at = w * SHORT_WINDOW_LINES + sb * SHORT_LINES;
+                    for (line, row) in out[at..at + SHORT_LINES].iter_mut().zip(&self.short_matrix)
+                    {
+                        *line = row.iter().zip(&z).map(|(c, v)| c * v).sum();
+                    }
+                }
+            } else {
+                let window = &self.windows[match block {
+                    Block::Start => 1,
+                    Block::Stop => 2,
+                    _ => 0,
+                }];
+                let z: [f32; N] = std::array::from_fn(|i| x(i) * window[i]);
+                let lines = &mut out[sb * LINES..(sb + 1) * LINES];
+                for (line, row) in lines.iter_mut().zip(self.matrix.iter()) {
+                    *line = row.iter().zip(&z).map(|(c, v)| c * v).sum();
+                }
             }
             self.prev[sb] = cur;
         }
@@ -186,14 +277,27 @@ impl HybridFilterbank {
     }
 
     /// Turn 576 PCM samples (oldest first) into 576 frequency lines.
-    pub fn granule(&mut self, pcm: &[f32; GRANULE_SAMPLES], out: &mut [f32; GRANULE_LINES]) {
+    ///
+    /// Alias reduction is applied to long-type blocks only: it acts across
+    /// subband boundaries of 18-line long spectra, which short blocks do not
+    /// have. original reading of §2.4.3.4 (the Committee Draft does not state
+    /// the short-block case); confirmed against ffmpeg and minimp3 in
+    /// `tests/decode.rs`, where the other choice wrecks short-block SNR.
+    pub fn granule(
+        &mut self,
+        pcm: &[f32; GRANULE_SAMPLES],
+        block: Block,
+        out: &mut [f32; GRANULE_LINES],
+    ) {
         let mut sub: SubbandGranule = [[0.0; SUBBANDS]; LINES];
         for (row, chunk) in sub.iter_mut().zip(pcm.chunks_exact(SUBBANDS)) {
             let input: &[f32; SUBBANDS] = chunk.try_into().expect("chunk of 32");
             self.analysis.process(input, row);
         }
-        self.mdct.granule(&sub, out);
-        alias_reduce(out, &self.cs, &self.ca);
+        self.mdct.granule(&sub, block, out);
+        if block != Block::Short {
+            alias_reduce(out, &self.cs, &self.ca);
+        }
     }
 }
 
@@ -213,7 +317,7 @@ mod tests {
 
     #[test]
     fn window_satisfies_princen_bradley() {
-        let w = long_window();
+        let w = block_window(Block::Normal);
         for i in 0..LINES {
             let s = w[i] * w[i] + w[i + LINES] * w[i + LINES];
             assert!((s - 1.0).abs() < 1e-6, "i={i}: {s}");
@@ -231,8 +335,8 @@ mod tests {
         for _ in 0..20 {
             let input: SubbandGranule =
                 std::array::from_fn(|_| std::array::from_fn(|_| noise(&mut seed)));
-            mdct.granule(&input, &mut lines);
-            let rec = imdct.granule(&lines.map(f64::from));
+            mdct.granule(&input, Block::Normal, &mut lines);
+            let rec = imdct.granule(&lines.map(f64::from), Block::Normal);
             // One granule of delay.
             if let Some(expect) = prev_input {
                 for t in 0..LINES {
@@ -255,7 +359,7 @@ mod tests {
         let mut input = [[0.0f32; SUBBANDS]; LINES];
         input[t0][0] = 1.0;
         let mut out = [0.0f32; GRANULE_LINES];
-        Mdct::new().granule(&input, &mut out);
+        Mdct::new().granule(&input, Block::Normal, &mut out);
         let i = (LINES + t0) as f64;
         let w = (PI / 36.0 * (i + 0.5)).sin();
         for (k, &line) in out[..LINES].iter().enumerate() {
@@ -290,7 +394,7 @@ mod tests {
                 row[sb] = v;
                 row
             });
-            mdct.granule(&input, &mut out);
+            mdct.granule(&input, Block::Normal, &mut out);
             if g > 0 {
                 for (e, &x) in energy.iter_mut().zip(&out) {
                     *e += f64::from(x) * f64::from(x);
@@ -353,8 +457,8 @@ mod tests {
         let mut lines = [0.0f32; GRANULE_LINES];
         let mut output = Vec::new();
         for chunk in input.chunks_exact(GRANULE_SAMPLES) {
-            enc.granule(chunk.try_into().unwrap(), &mut lines);
-            output.extend(dec.granule(&lines));
+            enc.granule(chunk.try_into().unwrap(), Block::Normal, &mut lines);
+            output.extend(dec.granule(&lines, Block::Normal));
         }
         let d = HybridFilterbank::DELAY;
         // Skip the start-up transient of the filters.
@@ -380,7 +484,7 @@ mod tests {
             for g in 0..12 {
                 let pcm: [f32; GRANULE_SAMPLES] =
                     std::array::from_fn(|i| (w * (g * GRANULE_SAMPLES + i) as f64).sin() as f32);
-                enc.granule(&pcm, &mut lines);
+                enc.granule(&pcm, Block::Normal, &mut lines);
                 if g >= 3 {
                     for (e, &x) in energy.iter_mut().zip(&lines) {
                         *e += f64::from(x) * f64::from(x);
@@ -391,6 +495,112 @@ mod tests {
                 .max_by(|&a, &b| energy[a].total_cmp(&energy[b]))
                 .unwrap();
             assert_eq!(peak, line);
+        }
+    }
+
+    /// Every valid sequence of block types (Annex C.1.5.3 state machine:
+    /// normal → start → short… → stop → normal, and stop → start).
+    const SEQUENCE: [Block; 14] = [
+        Block::Normal,
+        Block::Start,
+        Block::Short,
+        Block::Stop,
+        Block::Normal,
+        Block::Start,
+        Block::Short,
+        Block::Short,
+        Block::Short,
+        Block::Stop,
+        Block::Start,
+        Block::Short,
+        Block::Stop,
+        Block::Normal,
+    ];
+
+    #[test]
+    fn tdac_reconstruction_across_block_switching() {
+        let mut mdct = Mdct::new();
+        let mut imdct = Imdct::new();
+        let mut seed = 21;
+        let mut lines = [0.0f32; GRANULE_LINES];
+        let mut prev: Option<SubbandGranule> = None;
+        let mut max_err = 0.0f32;
+        for &block in &SEQUENCE {
+            let input: SubbandGranule =
+                std::array::from_fn(|_| std::array::from_fn(|_| noise(&mut seed)));
+            mdct.granule(&input, block, &mut lines);
+            let rec = imdct.granule(&lines.map(f64::from), block);
+            if let Some(expect) = prev {
+                for t in 0..LINES {
+                    for sb in 0..SUBBANDS {
+                        max_err = max_err.max((rec[t][sb] - expect[t][sb]).abs());
+                    }
+                }
+            }
+            prev = Some(input);
+        }
+        assert!(max_err < 1e-5, "max reconstruction error {max_err}");
+    }
+
+    #[test]
+    fn hybrid_round_trip_with_block_switching() {
+        let mut seed = 31;
+        let mut enc = HybridFilterbank::new();
+        let mut dec = HybridSynthesis::new();
+        let mut lines = [0.0f32; GRANULE_LINES];
+        let mut input = Vec::new();
+        let mut output = Vec::new();
+        for _ in 0..2 {
+            for &block in &SEQUENCE {
+                let pcm: [f32; GRANULE_SAMPLES] = std::array::from_fn(|_| 0.5 * noise(&mut seed));
+                enc.granule(&pcm, block, &mut lines);
+                output.extend(dec.granule(&lines, block));
+                input.extend_from_slice(&pcm);
+            }
+        }
+        let d = HybridFilterbank::DELAY;
+        let (mut sig, mut err) = (0.0f64, 0.0f64);
+        for n in 2 * GRANULE_SAMPLES..input.len() - d {
+            let x = f64::from(input[n]);
+            sig += x * x;
+            err += (output[n + d] - x).powi(2);
+        }
+        let snr = 10.0 * (sig / err).log10();
+        assert!(snr > 80.0, "round-trip SNR {snr:.1} dB");
+    }
+
+    #[test]
+    fn short_block_tone_lands_on_expected_line() {
+        // A subband-domain tone at the centre of short line m of subband sb
+        // (π/6 · (m + ½) per sample) peaks there in all three windows.
+        for (sb, m) in [(0usize, 0usize), (2, 3), (9, 5), (31, 1)] {
+            let mut mdct = Mdct::new();
+            let mut out = [0.0f32; GRANULE_LINES];
+            for g in 0..3 {
+                let input: SubbandGranule = std::array::from_fn(|t| {
+                    let n = (g * LINES + t) as f64;
+                    let mut v = (PI / 6.0 * (m as f64 + 0.5) * n + 0.2).cos() as f32;
+                    if sb % 2 == 1 && t % 2 == 1 {
+                        v = -v;
+                    }
+                    let mut row = [0.0f32; SUBBANDS];
+                    row[sb] = v;
+                    row
+                });
+                mdct.granule(&input, Block::Short, &mut out);
+            }
+            let window_energy = |w: usize| -> Vec<f32> {
+                (0..SHORT_WINDOW_LINES)
+                    .map(|l| out[w * SHORT_WINDOW_LINES + l].powi(2))
+                    .collect()
+            };
+            let total: Vec<f32> = (0..SHORT_WINDOW_LINES)
+                .map(|l| (0..3).map(|w| window_energy(w)[l]).sum())
+                .collect();
+            let peak = (0..SHORT_WINDOW_LINES)
+                .max_by(|&a, &b| total[a].total_cmp(&total[b]))
+                .unwrap();
+            assert_eq!(peak, sb * SHORT_LINES + m, "sb {sb} m {m}");
         }
     }
 }

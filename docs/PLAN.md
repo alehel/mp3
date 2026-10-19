@@ -105,9 +105,10 @@ Write correct frames whose granules carry zero spectral data.
 - Transient detection driven by PE jumps and/or energy attacks.
 - Short-block scalefactor bands and the outer-loop variant.
 - **Exit:** pre-echo on castanets, glockenspiel and applause audibly reduced.
-- 🎧 **Gate 1, artifact hunt:** a blind ABX against the original on the killer
-  samples at 192 kbps, plus a written list of audible artifact types. Expect
-  failures here. The point is to find out what metrics are missing.
+- 🎧 **Gate 1, short listen (maintainer decision 2026-10-19):** about 10
+  minutes, non-blind, on castanets and glockenspiel at 192 kbps against the
+  original: is the pre-echo before the attacks gone? Log a `smoke` row. The
+  blind ABX artifact hunt moves to M9 with the other formal tests.
 
 ## M7: Bit reservoir and joint stereo
 
@@ -117,6 +118,9 @@ Write correct frames whose granules carry zero spectral data.
   only useful below ~112 kbps.
 - **Exit:** gains on stereo-heavy and transient-heavy clips. No decoder
   reports reservoir errors.
+- 🎧 **Short stereo listen (maintainer decision 2026-10-19):** a few minutes on
+  headphones with wide-stereo clips: does the image stay stable? Log a
+  `smoke` row.
 
 ## M8: VBR, LSF, and metadata
 
@@ -132,8 +136,13 @@ Write correct frames whose granules carry zero spectral data.
   accepted constant with its run ID.
 - Performance: profile, then SIMD and multithreading (per-granule
   parallelism, psy model ahead of quantization).
+- 🎧 **Formal listening (maintainer decision 2026-10-19):** metrics drive
+  M6–M9; the heavy listening happens here. Start with the blind ABX artifact
+  hunt on the killer samples at 192 kbps (formerly gate 1), then review the
+  log of tuning decisions made on metrics alone (`PROVENANCE.md`) against
+  what listeners hear.
 - 🎧 **Gate 2 (comparative):** blind ABX of ours vs LAME at the same bitrate on
-  every sample where metrics show a gap or where gate 1 found issues.
+  every sample where metrics show a gap or where the artifact hunt found issues.
 - 🎧 **Gate 3 (release candidate):** run the holdout corpus. Transparency ABX
   vs original at 192 and 256 kbps by at least two listeners.
 

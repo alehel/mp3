@@ -11,7 +11,7 @@
 use std::f64::consts::PI;
 
 use crate::filterbank::WINDOW_Q21;
-use crate::mdct::{ALIAS_CI, GRANULE_LINES, LINES, SUBBANDS, SubbandGranule};
+use crate::mdct::{ALIAS_CI, Block, GRANULE_LINES, LINES, SUBBANDS, SubbandGranule};
 
 /// Decoder alias-reduction butterflies, Figure 3-A.6: for each subband
 /// boundary and i = 0..7, with `a = X[18·sb − 1 − i]` and `b = X[18·sb + i]`,
@@ -30,7 +30,51 @@ pub fn alias_butterflies(xr: &mut [f64; GRANULE_LINES]) {
     }
 }
 
-/// Long-block IMDCT, window, overlap-add and frequency inversion.
+/// IMDCT of `n/2` lines into `n` samples, unscaled, as written in
+/// 11172-3 §2.4.3.4: `x_i = Σ_k X_k cos(π/(2n) (2i + 1 + n/2)(2k + 1))`.
+fn imdct(x: &[f64]) -> Vec<f64> {
+    let n = 2 * x.len();
+    let nf = n as f64;
+    (0..n)
+        .map(|i| {
+            x.iter()
+                .enumerate()
+                .map(|(k, &v)| {
+                    v * (PI / (2.0 * nf)
+                        * (2.0 * i as f64 + 1.0 + nf / 2.0)
+                        * (2.0 * k as f64 + 1.0))
+                        .cos()
+                })
+                .sum()
+        })
+        .collect()
+}
+
+/// Decoder window for block types 0, 1, 3 (§2.4.3.4 "Windowing" a–c).
+fn long_window(block: Block, i: usize) -> f64 {
+    let long = (PI / 36.0 * (i as f64 + 0.5)).sin();
+    match block {
+        Block::Start => match i {
+            0..18 => long,
+            18..24 => 1.0,
+            24..30 => (PI / 12.0 * ((i - 18) as f64 + 0.5)).sin(),
+            _ => 0.0,
+        },
+        Block::Stop => match i {
+            0..6 => 0.0,
+            6..12 => (PI / 12.0 * ((i - 6) as f64 + 0.5)).sin(),
+            12..18 => 1.0,
+            _ => long,
+        },
+        _ => long,
+    }
+}
+
+/// IMDCT, window, overlap-add and frequency inversion for every block type.
+/// Short blocks (§2.4.3.4 "Windowing" d): window `j`'s six lines per
+/// subband go through a 12-point IMDCT and `sin(π/12 (i + ½))`, and the three
+/// results are overlapped at offsets 6, 12, 18 of a 36-sample vector with
+/// zeros elsewhere.
 pub struct Imdct {
     overlap: [[f64; LINES]; SUBBANDS],
 }
@@ -42,26 +86,26 @@ impl Imdct {
         }
     }
 
-    pub fn granule(&mut self, lines: &[f64; GRANULE_LINES]) -> SubbandGranule {
-        let n = 36.0;
+    pub fn granule(&mut self, lines: &[f64; GRANULE_LINES], block: Block) -> SubbandGranule {
         let mut out = [[0.0f32; SUBBANDS]; LINES];
         for sb in 0..SUBBANDS {
-            let x = &lines[sb * LINES..(sb + 1) * LINES];
-            // x_i = Σ_k X_k cos(π/(2n) (2i + 1 + n/2)(2k + 1)), then
-            // z_i = x_i sin(π/36 (i + 1/2)).
-            let z: Vec<f64> = (0..36)
-                .map(|i| {
-                    let xi: f64 = (0..LINES)
-                        .map(|k| {
-                            let arg = PI / (2.0 * n)
-                                * (2.0 * i as f64 + 1.0 + n / 2.0)
-                                * (2.0 * k as f64 + 1.0);
-                            x[k] * arg.cos()
-                        })
-                        .sum();
-                    xi * (PI / 36.0 * (i as f64 + 0.5)).sin()
-                })
-                .collect();
+            let z: Vec<f64> = if block == Block::Short {
+                let mut y = vec![0.0f64; 36];
+                for j in 0..3 {
+                    let at = j * 192 + sb * 6;
+                    let x = imdct(&lines[at..at + 6]);
+                    for (i, v) in x.iter().enumerate() {
+                        y[6 + 6 * j + i] += v * (PI / 12.0 * (i as f64 + 0.5)).sin();
+                    }
+                }
+                y
+            } else {
+                imdct(&lines[sb * LINES..(sb + 1) * LINES])
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| v * long_window(block, i))
+                    .collect()
+            };
             for t in 0..LINES {
                 let mut s = z[t] + self.overlap[sb][t];
                 if sb % 2 == 1 && t % 2 == 1 {
@@ -129,10 +173,12 @@ impl HybridSynthesis {
         }
     }
 
-    pub fn granule(&mut self, lines: &[f32; GRANULE_LINES]) -> Vec<f64> {
+    pub fn granule(&mut self, lines: &[f32; GRANULE_LINES], block: Block) -> Vec<f64> {
         let mut xr: [f64; GRANULE_LINES] = std::array::from_fn(|i| f64::from(lines[i]));
-        alias_butterflies(&mut xr);
-        let sub = self.imdct.granule(&xr);
+        if block != Block::Short {
+            alias_butterflies(&mut xr);
+        }
+        let sub = self.imdct.granule(&xr, block);
         sub.iter().flat_map(|row| self.synth.process(row)).collect()
     }
 }

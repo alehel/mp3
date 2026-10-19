@@ -1,9 +1,9 @@
 //! Clean-room MPEG-1/2 Audio Layer III (MP3) encoder.
 //!
-//! Status: M3. [`Encoder`] runs the hybrid filterbank, quantizes each
-//! granule with a global gain chosen to fit the frame (no psychoacoustics,
-//! no scalefactors, no bit reservoir) and Huffman-codes it. See
-//! `docs/PLAN.md`.
+//! Status: M4. [`Encoder`] runs the hybrid filterbank and the rate loop. The
+//! outer (distortion control) loop with scalefactors is available as
+//! [`NoiseShaping::AbsoluteThreshold`] but off by default until the
+//! psychoacoustic model (M5). No bit reservoir yet. See `docs/PLAN.md`.
 
 #![forbid(unsafe_code)]
 
@@ -26,7 +26,7 @@ pub mod stereo;
 use bitstream::BitWriter;
 use header::{ChannelMode, FrameHeader, PaddingState, StreamParams, Version};
 use mdct::{GRANULE_SAMPLES, HybridFilterbank};
-use quantize::{QuantizedGranule, ScalefactorBands};
+use quantize::{Ath, CodedGranule, ScalefactorBands};
 use sideinfo::{GranuleInfo, SideInfo, Window};
 
 /// Errors produced by the encoder and its I/O helpers.
@@ -92,6 +92,19 @@ pub enum StereoMode {
     Mono,
 }
 
+/// How the encoder decides where quantization noise may go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NoiseShaping {
+    /// One global quantizer step per granule (rate loop only, no
+    /// scalefactors). The default until the psychoacoustic model (M5).
+    #[default]
+    Off,
+    /// Outer loop with scalefactors, using the absolute threshold of hearing
+    /// as the allowed distortion (MPEG-1 only). Experimental: it scores
+    /// below `Off` on the dev corpus; see `quantize::outer_loop`.
+    AbsoluteThreshold,
+}
+
 /// Rate control mode.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RateControl {
@@ -107,6 +120,7 @@ pub struct EncoderConfig {
     pub channels: usize,
     pub rate: RateControl,
     pub stereo: StereoMode,
+    pub noise_shaping: NoiseShaping,
 }
 
 impl EncoderConfig {
@@ -116,6 +130,7 @@ impl EncoderConfig {
             channels,
             rate: RateControl::Cbr(bitrate_kbps),
             stereo: StereoMode::default(),
+            noise_shaping: NoiseShaping::default(),
         }
     }
 }
@@ -133,6 +148,9 @@ pub struct Encoder {
     /// One hybrid filterbank per coded channel.
     filterbanks: Vec<HybridFilterbank>,
     bands: ScalefactorBands,
+    /// Allowed distortion for the outer loop: present only with
+    /// [`NoiseShaping::AbsoluteThreshold`] at an MPEG-1 rate.
+    ath: Option<Ath>,
     /// Input samples per channel received so far, and samples coded.
     samples_in: usize,
     samples_coded: usize,
@@ -170,6 +188,10 @@ impl Encoder {
             padding: PaddingState::new(&params),
             pending: vec![Vec::new(); mode.channels()],
             filterbanks: vec![HybridFilterbank::new(); mode.channels()],
+            ath: match config.noise_shaping {
+                NoiseShaping::Off => None,
+                NoiseShaping::AbsoluteThreshold => Ath::new(config.sample_rate, &bands),
+            },
             bands,
             samples_in: 0,
             samples_coded: 0,
@@ -266,7 +288,7 @@ impl Encoder {
         let budget = ((main_bits / slots) as u32).min(4095);
 
         let mut side = SideInfo::silent();
-        let mut coded: Vec<QuantizedGranule> = Vec::with_capacity(slots);
+        let mut coded: Vec<CodedGranule> = Vec::with_capacity(slots);
         let mut xr = [0.0f32; quantize::GRANULE_LINES];
         for gr in 0..version.granules() {
             for ch in 0..channels {
@@ -275,22 +297,30 @@ impl Encoder {
                     .try_into()
                     .expect("whole granule");
                 self.filterbanks[ch].granule(pcm, &mut xr);
-                let q = quantize::rate_loop(&xr, &self.bands, budget);
+                let c = match &self.ath {
+                    Some(ath) => quantize::outer_loop(&xr, &self.bands, ath, budget),
+                    None => CodedGranule::without_scalefactors(quantize::rate_loop(
+                        &xr,
+                        &self.bands,
+                        budget,
+                    )),
+                };
+                let q = &c.q;
                 side.granules[gr][ch] = GranuleInfo {
-                    part2_3_length: q.plan.bits as u16,
+                    part2_3_length: c.part2_3_length() as u16,
                     big_values: q.plan.big_values,
                     global_gain: q.global_gain,
-                    scalefac_compress: 0,
+                    scalefac_compress: c.scalefac_compress.into(),
                     window: Window::Long {
                         table_select: q.plan.table_select,
                         region0_count: q.plan.region0_count,
                         region1_count: q.plan.region1_count,
                     },
-                    preflag: false,
-                    scalefac_scale: false,
+                    preflag: c.preflag,
+                    scalefac_scale: c.scalefac_scale,
                     count1table_select: q.plan.count1_table_b,
                 };
-                coded.push(q);
+                coded.push(c);
             }
         }
 
@@ -298,10 +328,15 @@ impl Encoder {
         header.write(&mut w);
         side.write(version, channels, &mut w);
         debug_assert_eq!(w.bit_len(), (4 + self.params.side_info_bytes(channels)) * 8);
-        // Main data in syntax order: for each granule, for each channel,
-        // scalefactors (none yet: slen1 = slen2 = 0) then Huffman bits.
-        for q in &coded {
-            huffman::write(&mut w, &q.ix, &q.plan, &self.bands);
+        // Main data in syntax order (11172-3 §2.4.1.7): for each granule,
+        // for each channel, scalefactors then Huffman bits. Long blocks with
+        // scfsi = 0: bands 0–10 at slen1 bits, bands 11–20 at slen2 bits.
+        for c in &coded {
+            let (slen1, slen2) = quantize::SLEN[usize::from(c.scalefac_compress)];
+            for (b, &v) in c.scalefac.iter().enumerate() {
+                w.put_bits(v.into(), if b < 11 { slen1 } else { slen2 }.into());
+            }
+            huffman::write(&mut w, &c.q.ix, &c.q.plan, &self.bands);
         }
         let mut frame = w.into_bytes();
         debug_assert!(frame.len() <= frame_bytes);

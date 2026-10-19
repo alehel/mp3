@@ -49,7 +49,8 @@ deny.toml             cargo-deny config that rejects copyleft dependencies
 | M1 Valid silent bitstream: side info, frame loop, decoder tests | done |
 | M2 Hybrid filterbank: polyphase analysis, long-block MDCT, alias reduction | done |
 | M3 Quantization and Huffman coding | done (smoke listen passed) |
-| M4–M9 | see [`docs/PLAN.md`](docs/PLAN.md) |
+| M4 Scalefactors and outer loop | implemented, opt-in; no gain over M3 with the absolute threshold alone (needs M5) |
+| M5–M9 | see [`docs/PLAN.md`](docs/PLAN.md) |
 
 ## Quick start
 

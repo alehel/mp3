@@ -250,3 +250,42 @@ pub fn decode_huffman(
     );
     is
 }
+
+/// Requantize a long-block granule (11172-3 §2.4.3.4 "Formula for
+/// requantization and all scaling", published constant 210; multiplier 0.5
+/// or 1 per `scalefac_scale`, 13818-3 §2.5.2):
+/// `xr = sign(is)·|is|^(4/3)·2^((global_gain − 210)/4)·2^(−mult·(scalefac + preflag·pretab))`.
+/// Band 21 has no scalefactor. Written independently of the encoder's noise
+/// measurement, which it is used to check.
+pub fn requantize_long(
+    is: &[i32; GRANULE_LINES],
+    global_gain: u8,
+    scalefac: &[u8; 21],
+    preflag: bool,
+    scalefac_scale: bool,
+    region_bounds: &[usize],
+) -> [f64; GRANULE_LINES] {
+    const PRETAB: [u8; 21] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 3, 2,
+    ];
+    let mult = if scalefac_scale { 1.0 } else { 0.5 };
+    let mut xr = [0.0f64; GRANULE_LINES];
+    for band in 0..22 {
+        let sf = if band < 21 {
+            f64::from(scalefac[band])
+                + if preflag {
+                    f64::from(PRETAB[band])
+                } else {
+                    0.0
+                }
+        } else {
+            0.0
+        };
+        let gain = 2f64.powf((f64::from(global_gain) - 210.0) / 4.0) * 2f64.powf(-mult * sf);
+        for i in region_bounds[band]..region_bounds[band + 1] {
+            xr[i] =
+                f64::from(is[i].signum()) * f64::from(is[i].unsigned_abs()).powf(4.0 / 3.0) * gain;
+        }
+    }
+    xr
+}

@@ -14,7 +14,9 @@ See docs/EVALUATION.md. Requires numpy and ffmpeg. lame and visqol are optional.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import datetime as dt
+import functools
 import json
 import re
 import subprocess
@@ -50,6 +52,20 @@ def encode_lame(wav: Path, out: Path, kbps: int) -> str | None:
     return None if proc.returncode == 0 else (proc.stderr.strip() or "lame failed")
 
 
+@functools.cache
+def visqol_flags() -> tuple[str, str]:
+    """Reference/degraded flag names for the installed `visqol`.
+
+    Google's C++ binary takes --reference_file/--degraded_file; the pure
+    Python port (visqol-python, Apache-2.0) takes --reference/--degraded.
+    Both print "MOS-LQO:" and default to audio mode.
+    """
+    help_text = run(["visqol", "--help"], check=False)
+    if "--reference_file" in help_text.stdout + help_text.stderr:
+        return "--reference_file", "--degraded_file"
+    return "--reference", "--degraded"
+
+
 def visqol_score(ref: np.ndarray, deg: np.ndarray, sr: int, tmp: Path) -> float | None:
     if not have("visqol"):
         return None
@@ -60,8 +76,8 @@ def visqol_score(ref: np.ndarray, deg: np.ndarray, sr: int, tmp: Path) -> float 
     for src, dst in ((r_path, r48), (d_path, d48)):
         run(["ffmpeg", "-v", "error", "-y", "-i", str(src), "-ar", str(VISQOL_RATE),
              "-c:a", "pcm_s16le", str(dst)])
-    proc = run(["visqol", "--reference_file", str(r48), "--degraded_file", str(d48)],
-               check=False)
+    ref_flag, deg_flag = visqol_flags()
+    proc = run(["visqol", ref_flag, str(r48), deg_flag, str(d48)], check=False)
     m = re.search(r"MOS-LQO:\s*([0-9.]+)", proc.stdout + proc.stderr)
     return float(m.group(1)) if m else None
 
@@ -135,6 +151,8 @@ def main() -> int:
     ap.add_argument("--keep", type=Path, help="keep encoded MP3s in this directory (e.g. for ABX)")
     ap.add_argument("--compare", help="run ID (or JSON path) to diff against")
     ap.add_argument("--run-id", help="name for this run (default: timestamp + commit)")
+    ap.add_argument("--jobs", type=int, default=1,
+                    help="clips to encode and score in parallel (ViSQOL is slow)")
     ap.add_argument("--allow-holdout", action="store_true",
                     help="required to evaluate a holdout corpus (human-approved gates only)")
     args = ap.parse_args()
@@ -168,29 +186,33 @@ def main() -> int:
     if args.keep:
         args.keep.mkdir(parents=True, exist_ok=True)
 
-    results = []
-    with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td)
-        for clip in clips:
+    def evaluate(clip: Path, kbps: int) -> dict:
+        # Each task gets its own temp directory: ViSQOL scratch files and
+        # encoder outputs must not collide between parallel jobs.
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
             sr, ch = probe(clip)
             ref, _ = decode(clip, sr, ch)
-            for kbps in args.bitrates:
-                row = {"clip": clip.name, "kbps": kbps, "sample_rate": sr, "channels": ch}
-                encoders = [("ours", lambda w, o, k: encode_ours(exe, w, o, k))]
-                if use_lame:
-                    encoders.append(("lame", encode_lame))
-                for name, enc in encoders:
-                    out = (args.keep or tmp) / f"{clip.stem}_{name}_{kbps}.mp3"
-                    err = enc(clip, out, kbps)
-                    if err:
-                        row[name] = {"error": err.splitlines()[-1]}
-                        continue
-                    try:
-                        row[name] = score(out, ref, sr, ch, tmp)
-                    except (RuntimeError, ValueError) as e:
-                        row[name] = {"error": str(e)}
-                results.append(row)
-                print(f"  {clip.name} @ {kbps} kbps done", file=sys.stderr)
+            row = {"clip": clip.name, "kbps": kbps, "sample_rate": sr, "channels": ch}
+            encoders = [("ours", lambda w, o, k: encode_ours(exe, w, o, k))]
+            if use_lame:
+                encoders.append(("lame", encode_lame))
+            for name, enc in encoders:
+                out = (args.keep or tmp) / f"{clip.stem}_{name}_{kbps}.mp3"
+                err = enc(clip, out, kbps)
+                if err:
+                    row[name] = {"error": err.splitlines()[-1]}
+                    continue
+                try:
+                    row[name] = score(out, ref, sr, ch, tmp)
+                except (RuntimeError, ValueError) as e:
+                    row[name] = {"error": str(e)}
+            print(f"  {clip.name} @ {kbps} kbps done", file=sys.stderr)
+            return row
+
+    tasks = [(clip, kbps) for clip in clips for kbps in args.bitrates]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
+        results = list(pool.map(lambda t: evaluate(*t), tasks))
 
     RESULTS.mkdir(parents=True, exist_ok=True)
     report = {

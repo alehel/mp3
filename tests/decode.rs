@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use mp3enc::mdct::HybridFilterbank;
-use mp3enc::{Encoder, EncoderConfig, StereoMode};
+use mp3enc::{Encoder, EncoderConfig, NoiseShaping, StereoMode};
 
 struct Case {
     sample_rate: u32,
@@ -21,6 +21,7 @@ struct Case {
     /// set a few dB under what this encoder measured when the case was
     /// added (no psychoacoustics yet), to catch regressions.
     min_snr_db: f64,
+    noise_shaping: NoiseShaping,
 }
 
 const CASES: &[Case] = &[
@@ -32,6 +33,7 @@ const CASES: &[Case] = &[
         bitrate: 128,
         stereo: StereoMode::Joint,
         min_snr_db: 25.0,
+        noise_shaping: NoiseShaping::Off,
     },
     Case {
         sample_rate: 44_100,
@@ -39,6 +41,7 @@ const CASES: &[Case] = &[
         bitrate: 320,
         stereo: StereoMode::Stereo,
         min_snr_db: 37.0,
+        noise_shaping: NoiseShaping::Off,
     },
     Case {
         sample_rate: 44_100,
@@ -46,6 +49,7 @@ const CASES: &[Case] = &[
         bitrate: 64,
         stereo: StereoMode::Joint,
         min_snr_db: 25.0,
+        noise_shaping: NoiseShaping::Off,
     },
     Case {
         sample_rate: 48_000,
@@ -53,6 +57,7 @@ const CASES: &[Case] = &[
         bitrate: 192,
         stereo: StereoMode::Mono,
         min_snr_db: 40.0,
+        noise_shaping: NoiseShaping::Off,
     },
     Case {
         sample_rate: 32_000,
@@ -60,6 +65,7 @@ const CASES: &[Case] = &[
         bitrate: 40,
         stereo: StereoMode::Joint,
         min_snr_db: 24.0,
+        noise_shaping: NoiseShaping::Off,
     },
     // LSF (13818-3) side-info layout and scalefactor bands.
     Case {
@@ -68,6 +74,7 @@ const CASES: &[Case] = &[
         bitrate: 64,
         stereo: StereoMode::Joint,
         min_snr_db: 24.0,
+        noise_shaping: NoiseShaping::Off,
     },
     Case {
         sample_rate: 24_000,
@@ -75,6 +82,25 @@ const CASES: &[Case] = &[
         bitrate: 32,
         stereo: StereoMode::Joint,
         min_snr_db: 23.0,
+        noise_shaping: NoiseShaping::Off,
+    },
+    // Outer loop with scalefactors (M4, opt-in): exercises scalefac_compress,
+    // preflag and scalefac_scale through real decoders.
+    Case {
+        sample_rate: 44_100,
+        channels: 2,
+        bitrate: 320,
+        stereo: StereoMode::Stereo,
+        min_snr_db: 37.0,
+        noise_shaping: NoiseShaping::AbsoluteThreshold,
+    },
+    Case {
+        sample_rate: 32_000,
+        channels: 1,
+        bitrate: 96,
+        stereo: StereoMode::Joint,
+        min_snr_db: 33.0,
+        noise_shaping: NoiseShaping::AbsoluteThreshold,
     },
 ];
 
@@ -123,6 +149,7 @@ fn encode(case: &Case) -> Encoded {
         .collect();
     let mut config = EncoderConfig::cbr(case.sample_rate, case.channels, case.bitrate);
     config.stereo = case.stereo;
+    config.noise_shaping = case.noise_shaping;
     let mut enc = Encoder::new(config).unwrap();
     let coded_channels = enc.channel_mode().channels();
     let spf = enc.stream_params().version.samples_per_frame();
@@ -148,10 +175,50 @@ fn encode(case: &Case) -> Encoded {
     Encoded { mp3, input, spf }
 }
 
+/// True if any MPEG-1 granule in the stream has non-zero
+/// `scalefac_compress` or `preflag` (side-info layout per 11172-3 §2.4.1.7:
+/// 9 + 5 + 4 bits (mono) or 9 + 3 + 8 bits (stereo) before the granules,
+/// 59 bits per granule and channel, `scalefac_compress` at offset 29 and
+/// `preflag` at offset 56 within each).
+fn uses_scalefactors(mp3: &[u8], channels: usize) -> bool {
+    const BITRATES: [usize; 15] = [
+        0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
+    ];
+    const RATES: [usize; 3] = [44_100, 48_000, 32_000];
+    let bit = |data: &[u8], pos: usize| (data[pos / 8] >> (7 - pos % 8)) & 1;
+    let field = |data: &[u8], pos: usize, n: usize| {
+        (0..n).fold(0usize, |acc, k| {
+            (acc << 1) | usize::from(bit(data, pos + k))
+        })
+    };
+    let mut pos = 0;
+    while pos + 4 <= mp3.len() {
+        let h = &mp3[pos..];
+        assert_eq!(
+            (h[0], h[1] & 0xFE),
+            (0xFF, 0xFA),
+            "MPEG-1 Layer III, no CRC"
+        );
+        let len = 144 * 1000 * BITRATES[usize::from(h[2] >> 4)]
+            / RATES[usize::from((h[2] >> 2) & 3)]
+            + usize::from((h[2] >> 1) & 1);
+        let side = &h[4..];
+        let first = if channels == 1 { 18 } else { 20 };
+        for g in 0..2 * channels {
+            let at = first + 59 * g;
+            if field(side, at + 29, 4) != 0 || bit(side, at + 56) == 1 {
+                return true;
+            }
+        }
+        pos += len;
+    }
+    false
+}
+
 fn label(case: &Case) -> String {
     format!(
-        "{} Hz {}ch {} kbps {:?}",
-        case.sample_rate, case.channels, case.bitrate, case.stereo
+        "{} Hz {}ch {} kbps {:?} {:?}",
+        case.sample_rate, case.channels, case.bitrate, case.stereo, case.noise_shaping
     )
 }
 
@@ -204,6 +271,13 @@ fn check_audio(case: &Case, enc: &Encoded, pcm: &[i16], decoder: &str) {
 fn minimp3_decodes_input() {
     for case in CASES {
         let enc = encode(case);
+        if case.noise_shaping != NoiseShaping::Off {
+            assert!(
+                uses_scalefactors(&enc.mp3, enc.input.len()),
+                "{}: no scalefactors in stream",
+                label(case)
+            );
+        }
         let mut dec = rmp3::Decoder::new(&enc.mp3);
         let mut pcm = Vec::new();
         while let Some(frame) = dec.next() {

@@ -42,7 +42,7 @@ Keep `corpus/SOURCES.md` listing every file, its origin and its licence.
 
 | Metric | Tool | Role |
 |---|---|---|
-| **ViSQOL v3, audio mode** (MOS-LQO, 1–5) | `visqol` binary (Apache-2.0, Google) | Primary objective score |
+| **ViSQOL v3, audio mode** (MOS-LQO, 1–5) | `visqol` binary (Apache-2.0, Google), or the pure-Python port `visqol-python` (Apache-2.0; `run_eval.py` detects either) | Primary objective score |
 | **PEAQ** (ODG, −4 to 0) | GstPEAQ or another implementation | Optional second opinion. Plug it into `run_eval.py` |
 | **Decode validity** | `ffmpeg -v error` | Hard pass/fail: any decoder error fails the run |
 | **Bitrate accuracy** | File size / duration | CBR must hit the target exactly; VBR is reported |
@@ -53,6 +53,23 @@ around 1105 samples total, but it depends). Decoders like ffmpeg trim it
 automatically only when the file carries gapless info, which ours won't until M8. `run_eval.py` aligns decoded output
 to the reference by cross-correlation before scoring. Never compare unaligned
 audio.
+
+### Setting up ViSQOL without Bazel
+
+Google's C++ ViSQOL needs Bazel to build. The pure-Python port
+`visqol-python` reports 9 of 10 audio-mode conformance tests identical to the
+C++ implementation. Install it in its own virtualenv (Debian's patched
+setuptools breaks its `libsvm-official` dependency build) and put it on PATH:
+
+```sh
+python3 -m venv ~/visqol-venv
+~/visqol-venv/bin/pip install visqol-python numba
+ln -s ~/visqol-venv/bin/visqol ~/.local/bin/visqol
+```
+
+It takes about 12 s per 10 s clip; use `run_eval.py --jobs N`. ViSQOL's
+audio mode saturates near 4.73, so at 192 kbps and above it rarely separates
+encoders; 128 kbps is where it is informative.
 
 ## The scoreboard
 

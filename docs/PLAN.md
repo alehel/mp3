@@ -66,6 +66,17 @@ Write correct frames whose granules carry zero spectral data.
   distortion, then re-run the inner loop (Annex C.1.5.4.4).
 - Allowed distortion is temporarily the absolute threshold of hearing only.
 - **Exit:** the eval harness shows a clear gain over M3 at 128 kbps.
+- **Status (2026-10-19): implemented, exit criterion not met.** Scalefactors,
+  `scalefac_compress`, `preflag` (used as scalefactor compression),
+  `scalefac_scale` and the outer loop work and decode correctly in ffmpeg and
+  minimp3. With the absolute threshold as the only allowed distortion, the
+  outer loop scores below M3 on the dev corpus (mean ViSQOL 4.38/4.60/4.64 vs
+  4.39/4.63/4.72 at 128/192/320 kbps, runs `m4-annex` vs `m3-baseline`): when
+  noise is above the threshold everywhere it has nothing to shape, and
+  otherwise it moves noise into the top octave. Two variants were worse
+  still (see `quantize::outer_loop`). The outer loop is therefore opt-in
+  (`NoiseShaping::AbsoluteThreshold`); the default encoder is bit-identical
+  to M3. It needs M5's masking threshold to pay off.
 
 ## M5: Psychoacoustic model
 

@@ -40,7 +40,7 @@ Write correct frames whose granules carry zero spectral data.
   reconstruction to within floating-point tolerance. Pure sines should land in
   the expected subband and line.
 
-## M3: Quantization and Huffman coding (no psychoacoustics) 🎧 smoke
+## M3: Quantization and Huffman coding (no psychoacoustics) 🎧 smoke ✅
 
 - Non-uniform quantizer `ix = nint((|xr| / 2^((global_gain - 210)/4))^0.75 - 0.0946)`
   per Annex C.1.5.4 (verify against your copy). Derive and document the rounding offset.
@@ -55,7 +55,8 @@ Write correct frames whose granules carry zero spectral data.
   (noisy is fine). Log `smoke` sessions to `listening/log.csv`.
 - **Status:** implemented; objective exit met (ffmpeg and minimp3 decode all
   test configurations at unit gain, 26–44 dB SNR on a synthetic test signal,
-  Huffman round trip exact). Waiting on the smoke listen.
+  Huffman round trip exact). Smoke listen passed 2026-10-19 (see
+  `listening/log.csv`).
 
 ## M4: Scalefactors and the outer loop
 

@@ -48,7 +48,7 @@ deny.toml             cargo-deny config that rejects copyleft dependencies
 | M0 Scaffolding: bit writer, WAV reader, frame header | done |
 | M1 Valid silent bitstream: side info, frame loop, decoder tests | done |
 | M2 Hybrid filterbank: polyphase analysis, long-block MDCT, alias reduction | done |
-| M3 Quantization and Huffman coding | implemented, awaiting 🎧 smoke listen |
+| M3 Quantization and Huffman coding | done (smoke listen passed) |
 | M4–M9 | see [`docs/PLAN.md`](docs/PLAN.md) |
 
 ## Quick start

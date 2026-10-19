@@ -9,13 +9,12 @@
 //! Clean-room reminder: derive from the sources above only. Cite clauses in
 //! comments and log every source in PROVENANCE.md (CLEANROOM.md).
 //!
-//! Status: M4. The outer (distortion control) loop with long-block
-//! scalefactors, `preflag` and `scalefac_scale` is implemented for MPEG-1,
-//! with the absolute threshold of hearing (Annex D Table 3-D.4) as the
-//! allowed distortion. It is opt-in ([`crate::NoiseShaping`]) because with
-//! that threshold alone it does not beat the rate loop (see [`outer_loop`]);
-//! M5's psychoacoustic model supplies the real allowed distortion. LSF
-//! granules use the rate loop alone (their scalefactor coding differs; M8).
+//! Status: M5. The outer (distortion control) loop with long-block
+//! scalefactors, `preflag` and `scalefac_scale`, for MPEG-1. Its allowed
+//! distortion comes from psychoacoustic model 2 (`crate::psy`, the default)
+//! or the absolute threshold of hearing (Annex D Table 3-D.4, experimental);
+//! see [`outer_loop`] and [`crate::NoiseShaping`]. LSF granules use the rate
+//! loop alone (their scalefactor coding differs; M8).
 
 use crate::huffman::{self, HuffmanPlan, MAX_BIG_VALUE};
 pub use crate::mdct::GRANULE_LINES;
@@ -387,6 +386,11 @@ impl Ath {
     pub fn xmin(&self, b: usize) -> f32 {
         self.xmin[b]
     }
+
+    /// All bands' allowed distortion, as the outer loop takes it.
+    pub fn xmin_all(&self) -> [f32; 22] {
+        self.xmin
+    }
 }
 
 /// A fully coded granule: quantized spectrum, Huffman plan and scalefactors.
@@ -457,8 +461,8 @@ fn band_noise(xr: &[f32; GRANULE_LINES], c: &CodedGranule, bands: &ScalefactorBa
 }
 
 /// Noise-to-threshold ratio per band, in dB (positive = audible).
-fn excess_db(noise: &[f32; 22], ath: &Ath) -> [f32; 22] {
-    std::array::from_fn(|b| 10.0 * (noise[b].max(1e-30) / ath.xmin(b)).log10())
+fn excess_db(noise: &[f32; 22], xmin: &[f32; 22]) -> [f32; 22] {
+    std::array::from_fn(|b| 10.0 * (noise[b].max(1e-30) / xmin[b].max(1e-30)).log10())
 }
 
 /// Largest noise-to-threshold excess of a granule, in dB. Lower is better.
@@ -496,8 +500,8 @@ const MAX_OUTER_ITERATIONS: usize = 32;
 /// Outer (distortion control) loop, Annex C.1.5.4 §3, long blocks.
 ///
 /// Repeatedly quantizes with the rate loop, measures each band's noise
-/// against the allowed distortion `ath`, and amplifies (raises the
-/// scalefactor of) bands, as §3.5 describes.
+/// against the allowed distortion `xmin` (mean noise energy per line, bands
+/// 0..=21), and amplifies (raises the scalefactor of) bands.
 ///
 /// As in §3.5, every band whose noise exceeds the allowed distortion is
 /// amplified by one step per iteration. original refinements: the smallest
@@ -518,22 +522,25 @@ const MAX_OUTER_ITERATIONS: usize = 32;
 /// threshold is high. Rejected variants: equalising the excess over the
 /// threshold (vocal quartet 128 kbps: 3.38 → 2.89) and keeping the
 /// iteration with the least total excess (violin 320 kbps: 4.71 → 4.17).
-/// The encoder therefore leaves this loop off by default until M5 supplies a
-/// masking threshold ([`crate::NoiseShaping`]).
+/// With psychoacoustic model 2's masking threshold (M5, run
+/// `m5b-q0.01-over-128`) the same loop lifts the 128 kbps dev mean from 4.39
+/// to 4.48. Amplifying only the bands within 1.5 dB of the worst
+/// noise-to-mask ratio (minimax) scored the same (4.48, run
+/// `m5b-q0.01-worst-128`), so the Annex rule is kept.
 ///
 /// It runs with `scalefac_scale` = 0 (√2 steps) and, if that hits the field
 /// limit, again with `scalefac_scale` = 1 (2× steps); the better is kept.
 pub fn outer_loop(
     xr: &[f32; GRANULE_LINES],
     bands: &ScalefactorBands,
-    ath: &Ath,
+    xmin: &[f32; 22],
     max_bits: u32,
 ) -> CodedGranule {
-    let (fine, fine_score, hit_limit) = outer_loop_with_scale(xr, bands, ath, max_bits, false);
+    let (fine, fine_score, hit_limit) = outer_loop_with_scale(xr, bands, xmin, max_bits, false);
     if !hit_limit {
         return fine;
     }
-    let (coarse, coarse_score, _) = outer_loop_with_scale(xr, bands, ath, max_bits, true);
+    let (coarse, coarse_score, _) = outer_loop_with_scale(xr, bands, xmin, max_bits, true);
     if coarse_score < fine_score {
         coarse
     } else {
@@ -546,7 +553,7 @@ pub fn outer_loop(
 fn outer_loop_with_scale(
     xr: &[f32; GRANULE_LINES],
     bands: &ScalefactorBands,
-    ath: &Ath,
+    xmin: &[f32; 22],
     max_bits: u32,
     scale: bool,
 ) -> (CodedGranule, f32, bool) {
@@ -582,7 +589,7 @@ fn outer_loop_with_scale(
             preflag,
             part2_length,
         };
-        let excess = excess_db(&band_noise(xr, &coded, bands), ath);
+        let excess = excess_db(&band_noise(xr, &coded, bands), xmin);
         let score = worst_excess(&excess);
         if best.as_ref().is_none_or(|(_, s)| score < *s - 0.01) {
             best = Some((coded, score));
@@ -806,7 +813,7 @@ mod tests {
             let level = if i < 100 { 0.05 } else { 1e-5 };
             *x = level * ((i as f32 * 1.7).sin() + 0.3);
         }
-        let c = outer_loop(&xr, &bands, &ath, 1500);
+        let c = outer_loop(&xr, &bands, &ath.xmin_all(), 1500);
         assert!(c.part2_3_length() <= 1500);
         assert!(
             c.scalefac.iter().any(|&v| v > 0) || c.preflag,

@@ -1,9 +1,9 @@
 //! Clean-room MPEG-1/2 Audio Layer III (MP3) encoder.
 //!
-//! Status: M4. [`Encoder`] runs the hybrid filterbank and the rate loop. The
-//! outer (distortion control) loop with scalefactors is available as
-//! [`NoiseShaping::AbsoluteThreshold`] but off by default until the
-//! psychoacoustic model (M5). No bit reservoir yet. See `docs/PLAN.md`.
+//! Status: M5. [`Encoder`] runs the hybrid filterbank, psychoacoustic model 2
+//! and the outer (distortion control) loop with scalefactors for MPEG-1; LSF
+//! uses the rate loop alone. Long blocks only, no bit reservoir yet. See
+//! `docs/PLAN.md`.
 
 #![forbid(unsafe_code)]
 
@@ -26,6 +26,7 @@ pub mod stereo;
 use bitstream::BitWriter;
 use header::{ChannelMode, FrameHeader, PaddingState, StreamParams, Version};
 use mdct::{GRANULE_SAMPLES, HybridFilterbank};
+use psy::PsyModel;
 use quantize::{Ath, CodedGranule, ScalefactorBands};
 use sideinfo::{GranuleInfo, SideInfo, Window};
 
@@ -96,13 +97,17 @@ pub enum StereoMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NoiseShaping {
     /// One global quantizer step per granule (rate loop only, no
-    /// scalefactors). The default until the psychoacoustic model (M5).
-    #[default]
+    /// scalefactors), as M3 encodes.
     Off,
     /// Outer loop with scalefactors, using the absolute threshold of hearing
     /// as the allowed distortion (MPEG-1 only). Experimental: it scores
     /// below `Off` on the dev corpus; see `quantize::outer_loop`.
     AbsoluteThreshold,
+    /// Outer loop with scalefactors, using psychoacoustic model 2's masking
+    /// threshold as the allowed distortion (MPEG-1 only; LSF falls back to
+    /// `Off` until M8). The default since M5.
+    #[default]
+    Psychoacoustic,
 }
 
 /// Rate control mode.
@@ -151,6 +156,12 @@ pub struct Encoder {
     /// Allowed distortion for the outer loop: present only with
     /// [`NoiseShaping::AbsoluteThreshold`] at an MPEG-1 rate.
     ath: Option<Ath>,
+    /// One psychoacoustic model per coded channel, with
+    /// [`NoiseShaping::Psychoacoustic`] at an MPEG-1 rate.
+    psy: Vec<PsyModel>,
+    /// The last [`psy::HISTORY`] samples before `pending`, per coded channel
+    /// (zeros at the start of the stream).
+    history: Vec<Vec<f32>>,
     /// Input samples per channel received so far, and samples coded.
     samples_in: usize,
     samples_coded: usize,
@@ -189,9 +200,16 @@ impl Encoder {
             pending: vec![Vec::new(); mode.channels()],
             filterbanks: vec![HybridFilterbank::new(); mode.channels()],
             ath: match config.noise_shaping {
-                NoiseShaping::Off => None,
                 NoiseShaping::AbsoluteThreshold => Ath::new(config.sample_rate, &bands),
+                _ => None,
             },
+            psy: match config.noise_shaping {
+                NoiseShaping::Psychoacoustic => (0..mode.channels())
+                    .map_while(|_| PsyModel::new(config.sample_rate, &bands))
+                    .collect(),
+                _ => Vec::new(),
+            },
+            history: vec![vec![0.0; psy::HISTORY]; mode.channels()],
             bands,
             samples_in: 0,
             samples_coded: 0,
@@ -243,8 +261,10 @@ impl Encoder {
         for f in 0..frames {
             self.write_frame(f * spf, &mut out);
         }
-        for buf in &mut self.pending {
-            buf.drain(..frames * spf);
+        for (hist, buf) in self.history.iter_mut().zip(&mut self.pending) {
+            hist.extend(buf.drain(..frames * spf));
+            let excess = hist.len() - psy::HISTORY;
+            hist.drain(..excess);
         }
         self.samples_coded += frames * spf;
         out
@@ -297,8 +317,39 @@ impl Encoder {
                     .try_into()
                     .expect("whole granule");
                 self.filterbanks[ch].granule(pcm, &mut xr);
-                let c = match &self.ath {
-                    Some(ath) => quantize::outer_loop(&xr, &self.bands, ath, budget),
+                let xmin = if let Some(model) = self.psy.get_mut(ch) {
+                    // Windows reach back before the granule into `history`.
+                    let (hist, buf) = (&self.history[ch], &self.pending[ch]);
+                    let window = |rel: isize, len: usize| -> Vec<f32> {
+                        (0..len)
+                            .map(|i| {
+                                let idx = start as isize + rel + i as isize;
+                                if idx < 0 {
+                                    hist[(psy::HISTORY as isize + idx) as usize]
+                                } else {
+                                    buf[idx as usize]
+                                }
+                            })
+                            .collect()
+                    };
+                    let long = window(psy::LONG_WINDOW_START, psy::LONG_FFT);
+                    let s = psy::SHORT_WINDOW_STARTS.map(|st| window(st, psy::SHORT_FFT));
+                    let res = model.analyze(&long, [&s[0], &s[1], &s[2]]);
+                    // original: the model's ratio is masking threshold over
+                    // signal energy per scalefactor band; applied to the
+                    // band's energy in our frequency lines it gives the
+                    // allowed noise, as a mean per line like the outer loop's
+                    // distortion measure (Annex C.1.5.4 §3.3).
+                    let b = self.bands.region_bounds();
+                    Some(std::array::from_fn(|sb| {
+                        let e: f32 = xr[b[sb]..b[sb + 1]].iter().map(|v| v * v).sum();
+                        res.ratio[sb] * e / (b[sb + 1] - b[sb]) as f32
+                    }))
+                } else {
+                    self.ath.as_ref().map(Ath::xmin_all)
+                };
+                let c = match xmin {
+                    Some(xmin) => quantize::outer_loop(&xr, &self.bands, &xmin, budget),
                     None => CodedGranule::without_scalefactors(quantize::rate_loop(
                         &xr,
                         &self.bands,

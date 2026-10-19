@@ -58,7 +58,7 @@ Write correct frames whose granules carry zero spectral data.
   Huffman round trip exact). Smoke listen passed 2026-10-19 (see
   `listening/log.csv`).
 
-## M4: Scalefactors and the outer loop
+## M4: Scalefactors and the outer loop ✅ (accepted without its exit criterion)
 
 - Scalefactor bands (long), `scalefac_compress`, `preflag`,
   `scalefac_scale`, slen tables.
@@ -77,8 +77,11 @@ Write correct frames whose granules carry zero spectral data.
   still (see `quantize::outer_loop`). The outer loop is therefore opt-in
   (`NoiseShaping::AbsoluteThreshold`); the default encoder is bit-identical
   to M3. It needs M5's masking threshold to pay off.
+- **Accepted 2026-10-19** by the maintainer as "machinery complete, gain
+  deferred to M5". M5's exit (consistent improvement over M4, whose default
+  output equals M3) carries the quality requirement forward.
 
-## M5: Psychoacoustic model
+## M5: Psychoacoustic model ✅
 
 - FFT-based model: spectrum, tonality estimate, spreading function,
   masking threshold per scalefactor band, perceptual entropy (PE).
@@ -86,6 +89,15 @@ Write correct frames whose granules carry zero spectral data.
   Spanias (2000) give the theory.
 - From now on `eval/run_eval.py` before and after every change is mandatory.
 - **Exit:** a consistent improvement over M4 across the dev corpus.
+- **Status (2026-10-19): done.** Model 2 with the Layer III adaptations
+  (Annex C.1.5.3), long blocks, MPEG-1 rates; its ratios drive the M4 outer
+  loop, now the default. Dev corpus, mean ViSQOL vs M4 (= M3) and LAME:
+  128 kbps 4.48 vs 4.39 (LAME 4.50), worst clip 4.02 vs 3.36, 16 of 21 clips
+  better; 192 kbps 4.63 vs 4.63; 320 kbps 4.72 vs 4.72. Regressions to check
+  by ear: organ at 128 kbps (−0.21) and violin at 192 kbps (−0.15). The
+  threshold-in-quiet scale (`psy::QTHR_SCALE`) is a tuning constant chosen
+  on dev; check it against the holdout at the next listening gate. Encoding
+  is now about 2× real time (outer loop on every granule); speed is M9.
 
 ## M6: Block switching 🎧 gate 1
 

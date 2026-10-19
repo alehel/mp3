@@ -102,6 +102,40 @@ const CASES: &[Case] = &[
         min_snr_db: 33.0,
         noise_shaping: NoiseShaping::AbsoluteThreshold,
     },
+    // Psychoacoustic model 2 + outer loop (M5 default). LSF falls back to
+    // the rate loop.
+    Case {
+        sample_rate: 44_100,
+        channels: 2,
+        bitrate: 128,
+        stereo: StereoMode::Joint,
+        min_snr_db: 24.0,
+        noise_shaping: NoiseShaping::Psychoacoustic,
+    },
+    Case {
+        sample_rate: 48_000,
+        channels: 1,
+        bitrate: 192,
+        stereo: StereoMode::Joint,
+        min_snr_db: 39.0,
+        noise_shaping: NoiseShaping::Psychoacoustic,
+    },
+    Case {
+        sample_rate: 32_000,
+        channels: 2,
+        bitrate: 96,
+        stereo: StereoMode::Stereo,
+        min_snr_db: 25.0,
+        noise_shaping: NoiseShaping::Psychoacoustic,
+    },
+    Case {
+        sample_rate: 22_050,
+        channels: 1,
+        bitrate: 48,
+        stereo: StereoMode::Joint,
+        min_snr_db: 28.0,
+        noise_shaping: NoiseShaping::Psychoacoustic,
+    },
 ];
 
 const SECONDS: usize = 4;
@@ -271,7 +305,8 @@ fn check_audio(case: &Case, enc: &Encoded, pcm: &[i16], decoder: &str) {
 fn minimp3_decodes_input() {
     for case in CASES {
         let enc = encode(case);
-        if case.noise_shaping != NoiseShaping::Off {
+        // The side-info parser handles MPEG-1 only; LSF has no outer loop yet.
+        if case.noise_shaping != NoiseShaping::Off && case.sample_rate >= 32_000 {
             assert!(
                 uses_scalefactors(&enc.mp3, enc.input.len()),
                 "{}: no scalefactors in stream",

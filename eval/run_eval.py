@@ -41,8 +41,8 @@ def build_ours() -> Path:
     return exe
 
 
-def encode_ours(exe: Path, wav: Path, out: Path, kbps: int) -> str | None:
-    proc = run([str(exe), str(wav), str(out), "--bitrate", str(kbps)], check=False)
+def encode_ours(exe: Path, wav: Path, out: Path, kbps: int, extra: list[str]) -> str | None:
+    proc = run([str(exe), str(wav), str(out), "--bitrate", str(kbps), *extra], check=False)
     return None if proc.returncode == 0 else (proc.stderr.strip() or "encoder failed")
 
 
@@ -148,6 +148,8 @@ def main() -> int:
     ap.add_argument("--bitrates", type=int, nargs="+", default=[128, 192, 320])
     ap.add_argument("--encoder", type=Path, help="path to mp3enc (default: cargo build --release)")
     ap.add_argument("--no-lame", action="store_true", help="skip the LAME baseline")
+    ap.add_argument("--ours-args", default="",
+                    help='extra arguments for our encoder, e.g. "--shaping psy"')
     ap.add_argument("--keep", type=Path, help="keep encoded MP3s in this directory (e.g. for ABX)")
     ap.add_argument("--compare", help="run ID (or JSON path) to diff against")
     ap.add_argument("--run-id", help="name for this run (default: timestamp + commit)")
@@ -194,7 +196,7 @@ def main() -> int:
             sr, ch = probe(clip)
             ref, _ = decode(clip, sr, ch)
             row = {"clip": clip.name, "kbps": kbps, "sample_rate": sr, "channels": ch}
-            encoders = [("ours", lambda w, o, k: encode_ours(exe, w, o, k))]
+            encoders = [("ours", lambda w, o, k: encode_ours(exe, w, o, k, args.ours_args.split()))]
             if use_lame:
                 encoders.append(("lame", encode_lame))
             for name, enc in encoders:

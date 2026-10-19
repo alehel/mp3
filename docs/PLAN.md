@@ -99,13 +99,18 @@ Write correct frames whose granules carry zero spectral data.
   on dev; check it against the holdout at the next listening gate. Encoding
   is now about 2× real time (outer loop on every granule); speed is M9.
 
-## M6: Block switching 🎧 gate 1
+## M6: Block switching 🎧 gate 1 ✅
 
 - Short blocks (3 × 192), start and stop windows, mixed blocks optional.
 - Transient detection driven by PE jumps and/or energy attacks.
 - Short-block scalefactor bands and the outer-loop variant.
 - **Exit:** pre-echo on castanets, glockenspiel and applause audibly reduced.
-- **Status (2026-10-19): implemented, awaiting the short listen.** Start,
+- **Status (2026-10-19): done.** Short listen logged in `listening/log.csv`:
+  at 64 kbps M6 is audibly better than M5 on castanets, little difference
+  on glockenspiel; at 192 kbps no clear difference and no artifacts.
+  Lesson: `pre_echo_db` shows whether pre-echo changed, not how audible it
+  is (glockenspiel −18 dB was barely heard; castanets −3 dB was heard).
+  Earlier status: Start,
   short and stop blocks (no mixed blocks), PE-driven switching with one
   granule of lookahead, short-block psychoacoustic thresholds, short
   scalefactors and implicit Huffman regions; ffmpeg and minimp3 decode it.

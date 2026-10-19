@@ -51,7 +51,7 @@ deny.toml             cargo-deny config that rejects copyleft dependencies
 | M3 Quantization and Huffman coding | done (smoke listen passed) |
 | M4 Scalefactors and outer loop | done (accepted; gain delivered with M5) |
 | M5 Psychoacoustic model 2 | done: 128 kbps dev ViSQOL 4.48 (M3 4.39, LAME 4.50) |
-| M6 Block switching | implemented; pre-echo −4 to −18 dB vs M5; awaiting 🎧 short listen |
+| M6 Block switching | done: pre-echo −4 to −18 dB vs M5; audible gain on castanets at 64 kbps |
 | M7–M9 | see [`docs/PLAN.md`](docs/PLAN.md) |
 
 ## Quick start

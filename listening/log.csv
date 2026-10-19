@@ -1,2 +1,6 @@
 date,listener,commit,clip,bitrate,test,a,b,trials,correct,p_value,artifacts,notes
 2026-10-19,aleksander,ff73961,Bluey (Joff Bush) - The BeeeeeOOP Walk,128,smoke,,,,,,,"Brief non-blind listen on full track; nothing wrong heard. Objective: 23.2 dB SNR vs input; 0.025% of samples exceed full scale (max +1.7 dB) on this loud master, no crackle reported."
+2026-10-19,aleksander,1f9b937,sqam27_castanets (EBU SQAM),64,smoke,M5 (long blocks),M6 (block switching),,,,pre-echo,"Non-blind, Listening Bench, against the original: M6 audibly better than M5. Metric: pre_echo_db -16.1 -> -18.8 dB (54 attacks)."
+2026-10-19,aleksander,1f9b937,sqam35_glockenspiel (EBU SQAM),64,smoke,M5 (long blocks),M6 (block switching),,,,,"Non-blind, Listening Bench: little difference heard, though pre_echo_db fell -15.6 -> -33.4 dB (3 attacks). The metric's size does not predict audibility."
+2026-10-19,aleksander,1f9b937,sqam27_castanets (EBU SQAM),192,smoke,M5 (long blocks),M6 (block switching),,,,,"Non-blind: no clear difference; no artifacts reported."
+2026-10-19,aleksander,1f9b937,sqam35_glockenspiel (EBU SQAM),192,smoke,M5 (long blocks),M6 (block switching),,,,,"Non-blind: no clear difference; no artifacts reported."

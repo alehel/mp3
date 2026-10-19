@@ -31,7 +31,10 @@ The agent stops and asks for a session at each gate (see `CLAUDE.md`).
 ## ABX procedure
 
 Use `eval/abx.py` (cross-platform, plays through `ffplay`) or foobar2000's ABX
-Comparator. Generate the files with `run_eval.py --keep out`.
+Comparator. For quick non-blind comparisons in a browser, the Listening Bench
+artifact (made in M6) loads an original plus encoded versions, lines them up
+automatically, loops a passage and switches between them with keys 1–9; its
+"Blind labels" mode hides which encoded version is which. Generate the files with `run_eval.py --keep out`.
 
 ```sh
 # Ours vs original (transparency test)

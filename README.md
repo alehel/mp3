@@ -49,8 +49,9 @@ deny.toml             cargo-deny config that rejects copyleft dependencies
 | M1 Valid silent bitstream: side info, frame loop, decoder tests | done |
 | M2 Hybrid filterbank: polyphase analysis, long-block MDCT, alias reduction | done |
 | M3 Quantization and Huffman coding | done (smoke listen passed) |
-| M4 Scalefactors and outer loop | implemented, opt-in; no gain over M3 with the absolute threshold alone (needs M5) |
-| M5–M9 | see [`docs/PLAN.md`](docs/PLAN.md) |
+| M4 Scalefactors and outer loop | done (accepted; gain delivered with M5) |
+| M5 Psychoacoustic model 2 | done: 128 kbps dev ViSQOL 4.48 (M3 4.39, LAME 4.50) |
+| M6–M9 | see [`docs/PLAN.md`](docs/PLAN.md) |
 
 ## Quick start
 

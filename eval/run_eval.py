@@ -28,7 +28,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import (REPO, align, decode, git_commit, have, pre_echo_db, probe,  # noqa: E402
-                    run, segmental_snr, write_wav_f32)
+                    run, segmental_snr, side_snr_db, write_wav_f32)
 
 RESULTS = REPO / "eval" / "results"
 VISQOL_RATE = 48_000  # ViSQOL audio mode expects 48 kHz
@@ -93,6 +93,7 @@ def score(mp3: Path, ref: np.ndarray, sr: int, ch: int, tmp: Path) -> dict:
         "actual_kbps": round(mp3.stat().st_size * 8 / duration / 1000, 2),
         "seg_snr_db": round(segmental_snr(r, d), 2),
         "pre_echo_db": (lambda v: None if v is None else round(v, 2))(pre_echo_db(r, d, sr)),
+        "side_snr_db": (lambda v: None if v is None else round(v, 2))(side_snr_db(r, d)),
         "visqol": visqol_score(r, d, sr, tmp),
     }
 

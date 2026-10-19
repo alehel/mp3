@@ -1,9 +1,9 @@
 //! Clean-room MPEG-1/2 Audio Layer III (MP3) encoder.
 //!
-//! Status: M5. [`Encoder`] runs the hybrid filterbank, psychoacoustic model 2
-//! and the outer (distortion control) loop with scalefactors for MPEG-1; LSF
-//! uses the rate loop alone. Long blocks only, no bit reservoir yet. See
-//! `docs/PLAN.md`.
+//! Status: M7. [`Encoder`] runs the hybrid filterbank with block switching,
+//! psychoacoustic model 2 and the outer (distortion control) loop with
+//! scalefactors for MPEG-1 (LSF uses the rate loop alone), with a bit
+//! reservoir and per-frame mid/side stereo. See `docs/PLAN.md`.
 
 #![forbid(unsafe_code)]
 
@@ -28,6 +28,7 @@ use header::{ChannelMode, FrameHeader, PaddingState, StreamParams, Version};
 use mdct::{Block, GRANULE_SAMPLES, HybridFilterbank};
 use psy::PsyModel;
 use quantize::{Ath, CodedGranule, ScalefactorBands};
+use reservoir::Reservoir;
 use sideinfo::{BlockType, GranuleInfo, SideInfo, Window};
 
 /// Errors produced by the encoder and its I/O helpers.
@@ -84,7 +85,8 @@ impl From<std::io::Error> for Error {
 /// Stereo coding strategy requested by the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StereoMode {
-    /// Encoder chooses L/R or M/S per frame (needs M7; behaves as `Stereo` before).
+    /// Encoder chooses L/R or M/S per frame (needs the psychoacoustic model;
+    /// with other noise shaping it codes L/R in joint-stereo frames).
     #[default]
     Joint,
     /// Independent left/right coding.
@@ -167,6 +169,13 @@ pub struct Encoder {
     lookahead: Vec<Option<psy::PsyResult>>,
     /// Block type of each channel's previous granule.
     prev_block: Vec<Block>,
+    /// Bit reservoir and the frames still open to it.
+    reservoir: Reservoir,
+    /// Both channels share block types (joint stereo with a psychoacoustic
+    /// model), so that mid/side coding is possible in every frame.
+    sync_blocks: bool,
+    /// Mid/side may be chosen per frame.
+    allow_ms: bool,
     /// Test hook: treat every granule as an attack (start, then short
     /// blocks throughout).
     force_short: bool,
@@ -200,9 +209,15 @@ impl Encoder {
                 intensity: false,
             },
         };
+        let joint = matches!(mode, ChannelMode::JointStereo { .. });
+        let psy_on = config.noise_shaping == NoiseShaping::Psychoacoustic
+            && PsyModel::new(config.sample_rate, &bands).is_some();
         Ok(Self {
             config,
             params,
+            reservoir: Reservoir::new(&params),
+            sync_blocks: joint && psy_on,
+            allow_ms: joint && psy_on,
             mode,
             padding: PaddingState::new(&params),
             pending: vec![Vec::new(); mode.channels()],
@@ -303,10 +318,51 @@ impl Encoder {
         for buf in &mut self.pending {
             buf.resize(buf.len() + pad, 0.0);
         }
-        Ok(self.drain_frames())
+        let mut out = self.drain_frames();
+        out.extend(self.reservoir.flush());
+        Ok(out)
     }
 
-    /// Block type for a channel's granule at `start` (an index into
+    /// `len` samples of channel `ch` starting `rel` samples from `at` (an
+    /// index into `pending`), reaching back into `history` when negative.
+    fn window(&self, ch: usize, at: usize, rel: isize, len: usize) -> Vec<f32> {
+        let (hist, buf) = (&self.history[ch], &self.pending[ch]);
+        (0..len)
+            .map(|i| {
+                let idx = at as isize + rel + i as isize;
+                if idx < 0 {
+                    hist[(psy::HISTORY as isize + idx) as usize]
+                } else {
+                    buf[idx as usize]
+                }
+            })
+            .collect()
+    }
+
+    /// Psychoacoustic result for a channel's granule at `start`, with
+    /// whether it and the next granule are attacks. `None` without a model.
+    fn psy_step(&mut self, ch: usize, start: usize) -> Option<(psy::PsyResult, bool, bool)> {
+        self.psy.get(ch)?;
+        let run = |this: &mut Self, at: usize| {
+            let long = this.window(ch, at, psy::LONG_WINDOW_START, psy::LONG_FFT);
+            let s = psy::SHORT_WINDOW_STARTS.map(|st| this.window(ch, at, st, psy::SHORT_FFT));
+            this.psy[ch].analyze(&long, [&s[0], &s[1], &s[2]])
+        };
+        let now = match self.lookahead[ch].take() {
+            Some(r) => r,
+            None => run(self, start),
+        };
+        let next = run(self, start + GRANULE_SAMPLES);
+        self.lookahead[ch] = Some(next);
+        let attacks = if self.force_short {
+            (true, true)
+        } else {
+            (now.pe > psy::PE_SWITCH, next.pe > psy::PE_SWITCH)
+        };
+        Some((now, attacks.0, attacks.1))
+    }
+
+    /// Block type for every channel's granule at `start` (an index into
     /// `pending`) and the psychoacoustic results that go with it: long-block
     /// ratios, and short-block ratios when the granule is short.
     ///
@@ -317,85 +373,85 @@ impl Encoder {
     /// a start block has to precede the short ones, so the decision looks at
     /// the *next* granule's attack (one granule of lookahead); a short run
     /// continues while either this or the next granule has an attack.
-    fn analyze(
-        &mut self,
-        ch: usize,
-        start: usize,
-    ) -> (Block, Option<psy::PsyResult>, Option<[[f32; 13]; 3]>) {
-        let Some(model) = self.psy.get_mut(ch) else {
-            return (Block::Normal, None, None);
-        };
-        let (hist, buf) = (&self.history[ch], &self.pending[ch]);
-        let window = |at: usize, rel: isize, len: usize| -> Vec<f32> {
-            (0..len)
-                .map(|i| {
-                    let idx = at as isize + rel + i as isize;
-                    if idx < 0 {
-                        hist[(psy::HISTORY as isize + idx) as usize]
-                    } else {
-                        buf[idx as usize]
-                    }
-                })
-                .collect()
-        };
-        let mut run = |at: usize| {
-            let long = window(at, psy::LONG_WINDOW_START, psy::LONG_FFT);
-            let s = psy::SHORT_WINDOW_STARTS.map(|st| window(at, st, psy::SHORT_FFT));
-            model.analyze(&long, [&s[0], &s[1], &s[2]])
-        };
-        let now = self.lookahead[ch].take().unwrap_or_else(|| run(start));
-        let next = run(start + GRANULE_SAMPLES);
-        self.lookahead[ch] = Some(next);
-        let (attack_now, attack_next) = if self.force_short {
-            (true, true)
-        } else {
-            (now.pe > psy::PE_SWITCH, next.pe > psy::PE_SWITCH)
-        };
-        let block = match self.prev_block[ch] {
-            Block::Start => Block::Short,
-            Block::Short if attack_now || attack_next => Block::Short,
-            Block::Short => Block::Stop,
-            _ if attack_next => Block::Start,
-            _ => Block::Normal,
-        };
-        self.prev_block[ch] = block;
-        let short = (block == Block::Short).then(|| {
-            let w = psy::SHORT_THRESHOLD_STARTS.map(|st| window(start, st, psy::SHORT_FFT));
-            self.psy[ch].analyze_short([&w[0], &w[1], &w[2]])
-        });
-        (block, Some(now), short)
+    ///
+    /// In joint stereo both channels switch together (an attack in either
+    /// counts for both), because mid/side coding needs the same block type
+    /// in both channels (11172-3 §2.4.3.4).
+    fn analyze_granule(&mut self, start: usize) -> Vec<Analysis> {
+        let channels = self.mode.channels();
+        let mut steps: Vec<_> = (0..channels).map(|ch| self.psy_step(ch, start)).collect();
+        if self.sync_blocks {
+            let now = steps.iter().flatten().any(|s| s.1);
+            let next = steps.iter().flatten().any(|s| s.2);
+            for s in steps.iter_mut().flatten() {
+                (s.1, s.2) = (now, next);
+            }
+        }
+        steps
+            .into_iter()
+            .enumerate()
+            .map(|(ch, step)| {
+                let Some((now, attack_now, attack_next)) = step else {
+                    return Analysis {
+                        block: Block::Normal,
+                        long: None,
+                        short: None,
+                    };
+                };
+                let block = match self.prev_block[ch] {
+                    Block::Start => Block::Short,
+                    Block::Short if attack_now || attack_next => Block::Short,
+                    Block::Short => Block::Stop,
+                    _ if attack_next => Block::Start,
+                    _ => Block::Normal,
+                };
+                self.prev_block[ch] = block;
+                let short = (block == Block::Short).then(|| {
+                    let w = psy::SHORT_THRESHOLD_STARTS
+                        .map(|st| self.window(ch, start, st, psy::SHORT_FFT));
+                    self.psy[ch].analyze_short([&w[0], &w[1], &w[2]])
+                });
+                Analysis {
+                    block,
+                    long: Some(now),
+                    short,
+                }
+            })
+            .collect()
     }
 
-    /// Append one frame coding `samples_per_frame` pending samples starting
-    /// at `offset`.
+    /// Append the bytes completed by coding one frame of `samples_per_frame`
+    /// pending samples starting at `offset`.
     ///
-    /// No bit reservoir yet (`main_data_begin` = 0), so each frame's main
-    /// data must fit in the frame itself. The space after the header and side
-    /// information is split evenly between granules and channels; unused
-    /// bits at the end are zero ancillary data (11172-3 §2.4.1.7).
+    /// Two passes. First every granule and channel is analysed: block type,
+    /// hybrid filterbank, allowed distortion per band. Then the frame picks
+    /// L/R or M/S (joint stereo, see [`stereo::prefer_mid_side`]), the bit
+    /// reservoir shares out the bits ([`reservoir::allocate`]), and each
+    /// granule-channel is quantized in syntax order; bits one leaves unused
+    /// go to the next, and what the frame leaves goes back to the reservoir.
     fn write_frame(&mut self, offset: usize, out: &mut Vec<u8>) {
         let version = self.params.version;
         let channels = self.mode.channels();
-        let header = FrameHeader::new(self.params, self.mode, self.padding.next_padding());
-        let frame_bytes = header.frame_bytes();
-        let main_bits = (frame_bytes - 4 - self.params.side_info_bytes(channels)) * 8;
-        let slots = version.granules() * channels;
-        // part2_3_length is a 12-bit field.
-        let budget = ((main_bits / slots) as u32).min(4095);
+        let granules = version.granules();
+        let padding = self.padding.next_padding();
+        let frame_bytes = self.params.frame_bytes(padding);
+        let side_bytes = 4 + self.params.side_info_bytes(channels);
+        let main_bytes = frame_bytes - side_bytes;
 
-        let mut side = SideInfo::silent();
-        let mut coded: Vec<CodedGranule> = Vec::with_capacity(slots);
-        let mut xr = [0.0f32; quantize::GRANULE_LINES];
-        for gr in 0..version.granules() {
-            for ch in 0..channels {
-                let start = offset + gr * GRANULE_SAMPLES;
-                let (block, psy_long, psy_short) = self.analyze(ch, start);
+        // Pass 1: analysis, `prepared[gr][ch]`.
+        let mut prepared: Vec<Vec<Prepared>> = Vec::with_capacity(granules);
+        for gr in 0..granules {
+            let start = offset + gr * GRANULE_SAMPLES;
+            let analyses = self.analyze_granule(start);
+            let mut row = Vec::with_capacity(channels);
+            for (ch, a) in analyses.into_iter().enumerate() {
                 let pcm: &[f32; GRANULE_SAMPLES] = self.pending[ch][start..start + GRANULE_SAMPLES]
                     .try_into()
                     .expect("whole granule");
-                self.filterbanks[ch].granule(pcm, block, &mut xr);
-                let layout = self.bands.layout(block);
-                let xr = if block == Block::Short {
+                let mut xr = [0.0f32; quantize::GRANULE_LINES];
+                self.filterbanks[ch].granule(pcm, a.block, &mut xr);
+                let layout = self.bands.layout(a.block);
+                let xr = if a.block == Block::Short {
                     self.bands.to_coded_order(&xr)
                 } else {
                     xr
@@ -409,7 +465,7 @@ impl Encoder {
                     let (lo, hi, _) = layout.bands[k];
                     ratio * xr[lo..hi].iter().map(|v| v * v).sum::<f32>() / (hi - lo) as f32
                 };
-                let xmin: Option<Vec<f32>> = match (psy_long, psy_short) {
+                let xmin: Option<Vec<f32>> = match (a.long, a.short) {
                     (_, Some(short)) => Some(
                         (0..layout.bands.len())
                             .map(|k| band_xmin(k, short[k % 3][k / 3]))
@@ -422,62 +478,150 @@ impl Encoder {
                     ),
                     (None, None) => self.ath.as_ref().map(|a| a.xmin_all().to_vec()),
                 };
-                let c = match xmin {
-                    Some(xmin) => quantize::outer_loop(&xr, &layout, &xmin, budget),
-                    None => CodedGranule::without_scalefactors(
-                        quantize::rate_loop(&xr, layout.regions, budget),
-                        block == Block::Short,
-                    ),
-                };
-                let q = &c.q;
-                let window = match block {
-                    Block::Normal => Window::Long {
-                        table_select: q.plan.table_select,
-                        region0_count: q.plan.region0_count,
-                        region1_count: q.plan.region1_count,
-                    },
-                    _ => Window::Switched {
-                        block_type: match block {
-                            Block::Start => BlockType::Start,
-                            Block::Short => BlockType::Short,
-                            _ => BlockType::Stop,
-                        },
-                        mixed_block_flag: false,
-                        table_select: [q.plan.table_select[0], q.plan.table_select[1]],
-                        subblock_gain: [0; 3],
-                    },
-                };
-                side.granules[gr][ch] = GranuleInfo {
-                    part2_3_length: c.part2_3_length() as u16,
-                    big_values: q.plan.big_values,
-                    global_gain: q.global_gain,
-                    scalefac_compress: c.scalefac_compress.into(),
-                    window,
-                    preflag: c.preflag,
-                    scalefac_scale: c.scalefac_scale,
-                    count1table_select: q.plan.count1_table_b,
-                };
-                coded.push(c);
+                row.push(Prepared {
+                    block: a.block,
+                    xr,
+                    xmin,
+                });
+            }
+            prepared.push(row);
+        }
+
+        // Mid/side decision for the whole frame.
+        let mut ms = false;
+        if self.allow_ms {
+            let all_xmin = prepared.iter().flatten().all(|p| p.xmin.is_some());
+            if all_xmin {
+                let (mut lr_bits, mut ms_bits) = (0.0, 0.0);
+                let mut ms_prepared = Vec::with_capacity(granules);
+                for row in &prepared {
+                    let (l, r) = (&row[0], &row[1]);
+                    debug_assert_eq!(l.block, r.block, "joint stereo syncs blocks");
+                    let layout = self.bands.layout(l.block);
+                    let (xl, xr) = (l.xmin.as_ref().unwrap(), r.xmin.as_ref().unwrap());
+                    lr_bits += quantize::demand_bits(&l.xr, &layout, xl)
+                        + quantize::demand_bits(&r.xr, &layout, xr);
+                    let x = stereo::mid_side_xmin(xl, xr);
+                    let (mut m, mut s) = (l.xr, r.xr);
+                    stereo::to_mid_side(&mut m, &mut s);
+                    ms_bits += quantize::demand_bits(&m, &layout, &x)
+                        + quantize::demand_bits(&s, &layout, &x);
+                    ms_prepared.push([(m, x.clone()), (s, x)]);
+                }
+                if stereo::prefer_mid_side(lr_bits, ms_bits) {
+                    ms = true;
+                    for (row, pair) in prepared.iter_mut().zip(ms_prepared) {
+                        for (p, (xr, xmin)) in row.iter_mut().zip(pair) {
+                            p.xr = xr;
+                            p.xmin = Some(xmin);
+                        }
+                    }
+                }
             }
         }
 
-        let mut w = BitWriter::with_capacity(frame_bytes);
+        // Pass 2: bit allocation and quantization.
+        let slots = granules * channels;
+        let demand: Vec<f32> = prepared
+            .iter()
+            .flatten()
+            .map(|p| match &p.xmin {
+                Some(x) => quantize::demand_bits(&p.xr, &self.bands.layout(p.block), x),
+                None => (main_bytes * 8 / slots) as f32,
+            })
+            .collect();
+        let budgets = self.reservoir.budgets(&demand, main_bytes);
+        let mut side = SideInfo {
+            main_data_begin: self.reservoir.content() as u16,
+            ..SideInfo::silent()
+        };
+        let mut coded: Vec<CodedGranule> = Vec::with_capacity(slots);
+        let mut carry = 0u32;
+        for (i, p) in prepared.iter().flatten().enumerate() {
+            let (gr, ch) = (i / channels, i % channels);
+            let available = budgets[i] + carry;
+            let budget = available.min(4095);
+            let layout = self.bands.layout(p.block);
+            let c = match &p.xmin {
+                Some(xmin) => quantize::outer_loop(&p.xr, &layout, xmin, budget),
+                None => CodedGranule::without_scalefactors(
+                    quantize::rate_loop(&p.xr, layout.regions, budget),
+                    p.block == Block::Short,
+                ),
+            };
+            assert!(c.part2_3_length() <= budget, "granule over budget");
+            carry = available - c.part2_3_length();
+            let q = &c.q;
+            let window = match p.block {
+                Block::Normal => Window::Long {
+                    table_select: q.plan.table_select,
+                    region0_count: q.plan.region0_count,
+                    region1_count: q.plan.region1_count,
+                },
+                block => Window::Switched {
+                    block_type: match block {
+                        Block::Start => BlockType::Start,
+                        Block::Short => BlockType::Short,
+                        _ => BlockType::Stop,
+                    },
+                    mixed_block_flag: false,
+                    table_select: [q.plan.table_select[0], q.plan.table_select[1]],
+                    subblock_gain: [0; 3],
+                },
+            };
+            side.granules[gr][ch] = GranuleInfo {
+                part2_3_length: c.part2_3_length() as u16,
+                big_values: q.plan.big_values,
+                global_gain: q.global_gain,
+                scalefac_compress: c.scalefac_compress.into(),
+                window,
+                preflag: c.preflag,
+                scalefac_scale: c.scalefac_scale,
+                count1table_select: q.plan.count1_table_b,
+            };
+            coded.push(c);
+        }
+
+        let mode = match self.mode {
+            ChannelMode::JointStereo { intensity, .. } => {
+                ChannelMode::JointStereo { ms, intensity }
+            }
+            m => m,
+        };
+        let header = FrameHeader::new(self.params, mode, padding);
+        let mut w = BitWriter::with_capacity(side_bytes);
         header.write(&mut w);
         side.write(version, channels, &mut w);
-        debug_assert_eq!(w.bit_len(), (4 + self.params.side_info_bytes(channels)) * 8);
+        debug_assert_eq!(w.bit_len(), side_bytes * 8);
         // Main data in syntax order (11172-3 §2.4.1.7): for each granule,
         // for each channel, scalefactors then Huffman bits (scfsi = 0).
+        let mut m = BitWriter::with_capacity(main_bytes + self.reservoir.content());
         for c in &coded {
             for (v, bits) in c.scalefactor_fields() {
-                w.put_bits(v.into(), bits.into());
+                m.put_bits(v.into(), bits.into());
             }
-            huffman::write(&mut w, &c.q.ix, &c.q.plan);
+            huffman::write(&mut m, &c.q.ix, &c.q.plan);
         }
-        let mut frame = w.into_bytes();
-        debug_assert!(frame.len() <= frame_bytes);
-        frame.resize(frame_bytes, 0);
-        out.extend_from_slice(&frame);
+        out.extend(
+            self.reservoir
+                .push(w.into_bytes(), frame_bytes, &m.into_bytes()),
+        );
     }
+}
+
+/// Block decision and psychoacoustic results for one granule-channel.
+struct Analysis {
+    block: Block,
+    long: Option<psy::PsyResult>,
+    short: Option<[[f32; 13]; 3]>,
+}
+
+/// One granule-channel ready to quantize: spectrum in coded order and its
+/// allowed distortion per layout band.
+struct Prepared {
+    block: Block,
+    xr: [f32; quantize::GRANULE_LINES],
+    xmin: Option<Vec<f32>>,
 }
 
 #[cfg(test)]
@@ -535,8 +679,10 @@ mod tests {
         for _ in 0..12 {
             mp3.extend(e.encode(&[&chunk, &chunk]).unwrap());
         }
-        // 12000 samples = 10 full frames + 480 buffered.
-        assert_eq!(frame_lengths(&mp3, e.stream_params()).len(), 10);
+        // 12000 samples = 10 full frames + 480 buffered. Frames whose space
+        // a later frame may still use (bit reservoir) are held back.
+        let early = frame_lengths(&mp3, e.stream_params()).len();
+        assert!((8..=10).contains(&early), "{early}");
         let params = *e.stream_params();
         mp3.extend(e.finish().unwrap());
         let lens = frame_lengths(&mp3, &params);
@@ -559,8 +705,10 @@ mod tests {
         let mut e = Encoder::new(config).unwrap();
         // One frame plus the encoder's lookahead.
         let x = [0.25f32; 1152 + 286];
-        let mp3 = e.encode(&[&x, &x]).unwrap();
-        assert_eq!(mp3.len(), e.stream_params().frame_bytes(false));
+        let mut mp3 = e.encode(&[&x, &x]).unwrap();
+        let first = e.stream_params().frame_bytes(false);
+        mp3.extend(e.finish().unwrap());
+        assert!(mp3.len() > first);
         // mode bits = '11' (single channel).
         assert_eq!(mp3[3] >> 6, 0b11);
     }

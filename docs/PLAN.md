@@ -136,6 +136,42 @@ Write correct frames whose granules carry zero spectral data.
 - 🎧 **Short stereo listen (maintainer decision 2026-10-19):** a few minutes on
   headphones with wide-stereo clips: does the image stay stable? Log a
   `smoke` row.
+- **Status (2026-10-19): implemented, awaiting the stereo listen.**
+  - **Bit reservoir:** `main_data_begin` per the DIS semantics. Capacity is
+    min(7680 − mean frame bits, 511 bytes), or 255 for LSF, so it is 0 at
+    320 kbps.
+  - **Allocation:** Annex C.1.5.4 §2.2 rules, with "max" read as min. Demand
+    is judged relative to a running average, and bits are shared within a
+    frame in proportion to a rate–distortion demand estimate.
+  - **Mid/side:** decided per frame when it lowers estimated bits. Both
+    channels' thresholds become min(L, R), so neither channel's noise can
+    exceed its own threshold.
+  - **Block types:** synced across channels in joint stereo. No intensity
+    stereo.
+  - **Results** (run `m7-final` vs `m6-blockswitch`, dev ViSQOL):
+
+    | kbps | M6 | M7 | LAME |
+    |---|---|---|---|
+    | 128 | 4.491 | 4.543 | 4.502 |
+    | 192 | 4.633 | 4.664 | 4.627 |
+    | 320 | 4.720 | 4.722 | 4.718 |
+
+  - **Gains by kind of clip:**
+    - Stereo-heavy at 128 kbps: choir +0.08, vocal quartet +0.07, guitar
+      +0.10, ABBA +0.01.
+    - Near-mono speech: +0.31/+0.32 (M/S).
+    - Transient-heavy clips: flat (castanets −0.002, claves +0.008). The
+      castanets pre-echo proxy is unchanged at 192 kbps (−28 dB; LAME −34).
+  - **Ablations** (`m7x-*`, `m7y-*`, `m7z-*`):
+    - M/S gives most of the gain.
+    - The reservoir only helps once demand is judged relatively.
+    - PE-driven borrowing cut pre-echo 2–3 dB on transient clips at
+      −0.007 mean ViSQOL. Not adopted; it goes to the listen.
+  - **Wide recordings rarely pick M/S:** 0–4% of frames for choir, quartet
+    and ABBA. The guitar switches in 23% of frames.
+  - **Decoders:** ffmpeg and minimp3 decode every case without warnings. A
+    correlated-stereo decode test checks that both M/S and reservoir
+    spill-over are exercised.
 
 ## M8: VBR, LSF, and metadata
 

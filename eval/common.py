@@ -142,3 +142,19 @@ def pre_echo_db(ref: np.ndarray, deg: np.ndarray, sample_rate: int) -> float | N
         sig = np.sum(x[s:s + pre] ** 2)
         vals.append(10 * np.log10(noise / sig + 1e-20))
     return float(np.mean(vals)) if vals else None
+
+
+def side_snr_db(ref: np.ndarray, deg: np.ndarray) -> float | None:
+    """Segmental SNR of the side signal (L − R)/2, in dB.
+
+    ViSQOL and the other metrics look at a mono downmix, so they cannot see
+    damage to the stereo image (e.g. from mid/side coding). This is a crude
+    proxy for that: it does not model binaural masking, and near-mono clips,
+    whose side signal is mostly below the silence gate, give few frames.
+    Returns None for mono input or a silent side signal.
+    """
+    if ref.shape[1] != 2:
+        return None
+    side = lambda a: (0.5 * (a[:, 0] - a[:, 1]))[:, None]
+    v = segmental_snr(side(ref), side(deg))
+    return None if np.isnan(v) else v

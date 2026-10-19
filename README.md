@@ -32,7 +32,7 @@ docs/PLAN.md          staged milestones with exit criteria
 docs/EVALUATION.md    corpus, metrics, scoreboard
 docs/LISTENING.md     human listening protocol
 docs/RESEARCH.md      landscape and allowed references
-src/                  the encoder (bitstream through Huffman coding done; psy, scalefactors, reservoir, stereo staged)
+src/                  the encoder (filterbank, psychoacoustic model 2, outer loop, block switching, reservoir, mid/side)
 tests/                decoder round-trip tests (minimp3 always, ffmpeg if on PATH)
 eval/run_eval.py      objective eval harness (ffmpeg + optional ViSQOL, LAME baseline)
 eval/abx.py           blind ABX listening tool
@@ -52,7 +52,8 @@ deny.toml             cargo-deny config that rejects copyleft dependencies
 | M4 Scalefactors and outer loop | done (accepted; gain delivered with M5) |
 | M5 Psychoacoustic model 2 | done: 128 kbps dev ViSQOL 4.48 (M3 4.39, LAME 4.50) |
 | M6 Block switching | done: pre-echo −4 to −18 dB vs M5; audible gain on castanets at 64 kbps |
-| M7–M9 | see [`docs/PLAN.md`](docs/PLAN.md) |
+| M7 Bit reservoir and mid/side stereo | implemented, awaiting stereo listen: 128 kbps dev ViSQOL 4.54 (M6 4.49, LAME 4.50) |
+| M8–M9 | see [`docs/PLAN.md`](docs/PLAN.md) |
 
 ## Quick start
 

@@ -22,6 +22,9 @@ struct Case {
     /// added (no psychoacoustics yet), to catch regressions.
     min_snr_db: f64,
     noise_shaping: NoiseShaping,
+    /// The second channel is 0.9 × the first plus a little of its own
+    /// signal, so the encoder should pick mid/side.
+    correlated: bool,
 }
 
 const CASES: &[Case] = &[
@@ -34,6 +37,7 @@ const CASES: &[Case] = &[
         stereo: StereoMode::Joint,
         min_snr_db: 25.0,
         noise_shaping: NoiseShaping::Off,
+        correlated: false,
     },
     Case {
         sample_rate: 44_100,
@@ -42,6 +46,7 @@ const CASES: &[Case] = &[
         stereo: StereoMode::Stereo,
         min_snr_db: 37.0,
         noise_shaping: NoiseShaping::Off,
+        correlated: false,
     },
     Case {
         sample_rate: 44_100,
@@ -50,6 +55,7 @@ const CASES: &[Case] = &[
         stereo: StereoMode::Joint,
         min_snr_db: 25.0,
         noise_shaping: NoiseShaping::Off,
+        correlated: false,
     },
     Case {
         sample_rate: 48_000,
@@ -58,6 +64,7 @@ const CASES: &[Case] = &[
         stereo: StereoMode::Mono,
         min_snr_db: 40.0,
         noise_shaping: NoiseShaping::Off,
+        correlated: false,
     },
     Case {
         sample_rate: 32_000,
@@ -66,6 +73,7 @@ const CASES: &[Case] = &[
         stereo: StereoMode::Joint,
         min_snr_db: 24.0,
         noise_shaping: NoiseShaping::Off,
+        correlated: false,
     },
     // LSF (13818-3) side-info layout and scalefactor bands.
     Case {
@@ -75,6 +83,7 @@ const CASES: &[Case] = &[
         stereo: StereoMode::Joint,
         min_snr_db: 24.0,
         noise_shaping: NoiseShaping::Off,
+        correlated: false,
     },
     Case {
         sample_rate: 24_000,
@@ -83,6 +92,7 @@ const CASES: &[Case] = &[
         stereo: StereoMode::Joint,
         min_snr_db: 23.0,
         noise_shaping: NoiseShaping::Off,
+        correlated: false,
     },
     // Outer loop with scalefactors (M4, opt-in): exercises scalefac_compress,
     // preflag and scalefac_scale through real decoders.
@@ -93,6 +103,7 @@ const CASES: &[Case] = &[
         stereo: StereoMode::Stereo,
         min_snr_db: 37.0,
         noise_shaping: NoiseShaping::AbsoluteThreshold,
+        correlated: false,
     },
     Case {
         sample_rate: 32_000,
@@ -101,6 +112,7 @@ const CASES: &[Case] = &[
         stereo: StereoMode::Joint,
         min_snr_db: 33.0,
         noise_shaping: NoiseShaping::AbsoluteThreshold,
+        correlated: false,
     },
     // Psychoacoustic model 2 + outer loop (M5 default). LSF falls back to
     // the rate loop.
@@ -111,6 +123,7 @@ const CASES: &[Case] = &[
         stereo: StereoMode::Joint,
         min_snr_db: 24.0,
         noise_shaping: NoiseShaping::Psychoacoustic,
+        correlated: false,
     },
     Case {
         sample_rate: 48_000,
@@ -119,6 +132,7 @@ const CASES: &[Case] = &[
         stereo: StereoMode::Joint,
         min_snr_db: 39.0,
         noise_shaping: NoiseShaping::Psychoacoustic,
+        correlated: false,
     },
     Case {
         sample_rate: 32_000,
@@ -127,6 +141,7 @@ const CASES: &[Case] = &[
         stereo: StereoMode::Stereo,
         min_snr_db: 25.0,
         noise_shaping: NoiseShaping::Psychoacoustic,
+        correlated: false,
     },
     Case {
         sample_rate: 22_050,
@@ -135,6 +150,18 @@ const CASES: &[Case] = &[
         stereo: StereoMode::Joint,
         min_snr_db: 28.0,
         noise_shaping: NoiseShaping::Psychoacoustic,
+        correlated: false,
+    },
+    // Mostly-correlated stereo: mid/side frames and bit-reservoir spill-over
+    // (M7) through real decoders.
+    Case {
+        sample_rate: 44_100,
+        channels: 2,
+        bitrate: 128,
+        stereo: StereoMode::Joint,
+        min_snr_db: 29.0,
+        noise_shaping: NoiseShaping::Psychoacoustic,
+        correlated: true,
     },
 ];
 
@@ -178,9 +205,17 @@ struct Encoded {
 
 fn encode(case: &Case) -> Encoded {
     let n = case.sample_rate as usize * SECONDS;
-    let planes: Vec<Vec<f32>> = (0..case.channels)
+    let mut planes: Vec<Vec<f32>> = (0..case.channels)
         .map(|c| test_signal(case.sample_rate, c, n))
         .collect();
+    if case.correlated {
+        let own = std::mem::take(&mut planes[1]);
+        planes[1] = planes[0]
+            .iter()
+            .zip(&own)
+            .map(|(a, b)| 0.9 * a + 0.1 * b)
+            .collect();
+    }
     let mut config = EncoderConfig::cbr(case.sample_rate, case.channels, case.bitrate);
     config.stereo = case.stereo;
     config.noise_shaping = case.noise_shaping;
@@ -249,10 +284,58 @@ fn uses_scalefactors(mp3: &[u8], channels: usize) -> bool {
     false
 }
 
+/// Per MPEG-1 frame: whether `mode_extension` has ms_stereo set, and
+/// `main_data_begin` (the first 9 bits after the header, 11172-3 §2.4.1.7).
+fn frame_fields(mp3: &[u8]) -> Vec<(bool, usize)> {
+    const BITRATES: [usize; 15] = [
+        0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
+    ];
+    const RATES: [usize; 3] = [44_100, 48_000, 32_000];
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos + 6 <= mp3.len() {
+        let h = &mp3[pos..];
+        let joint = h[3] >> 6 == 0b01;
+        let ms = joint && (h[3] >> 5) & 1 == 1;
+        let main_data_begin = (usize::from(h[4]) << 1) | usize::from(h[5] >> 7);
+        out.push((ms, main_data_begin));
+        pos += 144 * 1000 * BITRATES[usize::from(h[2] >> 4)] / RATES[usize::from((h[2] >> 2) & 3)]
+            + usize::from((h[2] >> 1) & 1);
+    }
+    out
+}
+
+/// For the correlated case, check that mid/side and the bit reservoir were
+/// actually exercised (otherwise the decode checks prove little).
+fn check_stream_features(case: &Case, mp3: &[u8]) {
+    if !case.correlated {
+        return;
+    }
+    let fields = frame_fields(mp3);
+    let ms = fields.iter().filter(|f| f.0).count();
+    let borrowed = fields.iter().filter(|f| f.1 > 0).count();
+    assert!(
+        ms * 2 > fields.len(),
+        "{}: only {ms} of {} frames use mid/side",
+        label(case),
+        fields.len()
+    );
+    assert!(
+        borrowed * 2 > fields.len(),
+        "{}: only {borrowed} frames have main_data_begin > 0",
+        label(case)
+    );
+}
+
 fn label(case: &Case) -> String {
     format!(
-        "{} Hz {}ch {} kbps {:?} {:?}",
-        case.sample_rate, case.channels, case.bitrate, case.stereo, case.noise_shaping
+        "{} Hz {}ch {} kbps {:?} {:?}{}",
+        case.sample_rate,
+        case.channels,
+        case.bitrate,
+        case.stereo,
+        case.noise_shaping,
+        if case.correlated { " correlated" } else { "" }
     )
 }
 
@@ -313,6 +396,7 @@ fn minimp3_decodes_input() {
                 label(case)
             );
         }
+        check_stream_features(case, &enc.mp3);
         let mut dec = rmp3::Decoder::new(&enc.mp3);
         let mut pcm = Vec::new();
         while let Some(frame) = dec.next() {

@@ -620,6 +620,35 @@ fn represent(t: &[u8; MAX_SCALEFACS], short: bool) -> Option<([u8; MAX_SCALEFACS
     }
 }
 
+/// Estimated bits to code `xr` (coded order for `layout`) with at most
+/// `xmin` mean noise per line in each band.
+///
+/// original, from rate–distortion theory for a Gaussian source (Shannon):
+/// coding a line of variance σ² with mean squared error D takes
+/// `max(0, ½·log2(σ²/D))` bits. Summed over each band's lines with σ² its
+/// mean energy per line. It plays the role of the perceptual entropy in
+/// Annex C.1.5.4 (demand for the bit reservoir), computed on the coded
+/// spectrum so it also applies to mid/side channels.
+pub fn demand_bits(xr: &[f32; GRANULE_LINES], layout: &Layout, xmin: &[f32]) -> f32 {
+    layout
+        .bands
+        .iter()
+        .zip(xmin)
+        .map(|(&(lo, hi, _), &x)| {
+            let w = (hi - lo) as f32;
+            let energy = xr[lo..hi].iter().map(|v| v * v).sum::<f32>() / w;
+            if energy > x && x > 0.0 {
+                0.5 * w * (energy / x).log2()
+            } else if x <= 0.0 && energy > 0.0 {
+                // No allowed distortion at all: treat as very demanding.
+                w * 16.0
+            } else {
+                0.0
+            }
+        })
+        .sum()
+}
+
 /// Outer-loop iteration cap. original: a guard on encoding time; the loop
 /// normally ends earlier on convergence (see `outer_loop`).
 const MAX_OUTER_ITERATIONS: usize = 32;
@@ -707,6 +736,9 @@ fn outer_loop_with_scale(
             hit_limit = true;
             break;
         };
+        if part2_length > max_bits {
+            break; // scalefactors alone would exceed the budget
+        }
         let mut coded = CodedGranule {
             q: QuantizedGranule {
                 global_gain: 0,

@@ -48,6 +48,7 @@ Keep `corpus/SOURCES.md` listing every file, its origin and its licence.
 | **Bitrate accuracy** | File size / duration | CBR must hit the target exactly; VBR is reported |
 | **Segmental SNR** | Built in | Sanity check only, not perceptual. Useful for catching bugs in M2–M4 |
 | **Pre-echo** (dB, lower is better) | Built in (`pre_echo_db` in the results JSON) | Coding noise in the 10 ms before each detected attack relative to the attack's energy. Added in M6 because ViSQOL barely registers pre-echo. It shows whether pre-echo changed, not how audible it is: in the M6 listen a −18 dB change on glockenspiel (3 attacks) was barely heard while −3 dB on castanets (54 attacks) was |
+| **Side-signal SNR** (dB, higher is better) | Built in (`side_snr_db`) | Segmental SNR of (L − R)/2. Added in M7 because ViSQOL and the other metrics score a mono downmix and cannot see stereo-image damage. Crude: no binaural masking model, and it favours spending bits on the side channel whether or not that is audible (in M7, splitting bits evenly between mid and side raised it 1.6 dB while ViSQOL fell 0.03). Use it to spot regressions in the stereo image; the stereo listen decides |
 
 MP3 encoders and decoders add delay (encoder delay plus decoder delay, often
 around 1105 samples total, but it depends). Decoders like ffmpeg trim it

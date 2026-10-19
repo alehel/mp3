@@ -105,6 +105,16 @@ Write correct frames whose granules carry zero spectral data.
 - Transient detection driven by PE jumps and/or energy attacks.
 - Short-block scalefactor bands and the outer-loop variant.
 - **Exit:** pre-echo on castanets, glockenspiel and applause audibly reduced.
+- **Status (2026-10-19): implemented, awaiting the short listen.** Start,
+  short and stop blocks (no mixed blocks), PE-driven switching with one
+  granule of lookahead, short-block psychoacoustic thresholds, short
+  scalefactors and implicit Huffman regions; ffmpeg and minimp3 decode it.
+  Pre-echo (noise in the 10 ms before attacks, `pre_echo_db`) vs M5:
+  glockenspiel −18 dB, claves −11 dB, castanets −4 dB. ViSQOL mean 4.491 /
+  4.633 / 4.720 at 128 / 192 / 320 kbps (M5 4.483 / 4.629 / 4.718; LAME 4.502
+  / 4.627 / 4.718), no clip worse by 0.02 or more. LAME still has less
+  pre-echo (castanets 192 kbps −34 vs −28 dB): an M9 target. The dev corpus
+  has no applause clip; listen to castanets and glockenspiel.
 - 🎧 **Gate 1, short listen (maintainer decision 2026-10-19):** about 10
   minutes, non-blind, on castanets and glockenspiel at 192 kbps against the
   original: is the pre-echo before the attacks gone? Log a `smoke` row. The

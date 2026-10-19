@@ -335,3 +335,40 @@ pub fn requantize_long(
     }
     xr
 }
+
+/// Requantize a short-block granule given in coded order (11172-3 §2.4.3.4
+/// "Formula for requantization and all scaling", short-block case):
+/// `xr = sign(is)·|is|^(4/3)·2^((global_gain − 210 − 8·subblock_gain[w])/4)
+/// ·2^(−mult·scalefac_s[sfb][w])`; band 12 has no scalefactor and no pretab
+/// applies. Coded order is band, window, frequency (13818-3 §2.5.2).
+pub fn requantize_short(
+    is: &[i32; GRANULE_LINES],
+    global_gain: u8,
+    subblock_gain: [u8; 3],
+    scalefac: &[u8; 36],
+    scalefac_scale: bool,
+    short_widths: &[usize; 13],
+) -> [f64; GRANULE_LINES] {
+    let mult = if scalefac_scale { 1.0 } else { 0.5 };
+    let mut xr = [0.0f64; GRANULE_LINES];
+    let mut pos = 0;
+    for (sfb, &width) in short_widths.iter().enumerate() {
+        for w in 0..3 {
+            let sf = if sfb < 12 {
+                f64::from(scalefac[3 * sfb + w])
+            } else {
+                0.0
+            };
+            let gain = 2f64
+                .powf((f64::from(global_gain) - 210.0 - 8.0 * f64::from(subblock_gain[w])) / 4.0)
+                * 2f64.powf(-mult * sf);
+            for i in pos..pos + width {
+                xr[i] = f64::from(is[i].signum())
+                    * f64::from(is[i].unsigned_abs()).powf(4.0 / 3.0)
+                    * gain;
+            }
+            pos += width;
+        }
+    }
+    xr
+}

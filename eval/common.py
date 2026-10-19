@@ -114,3 +114,31 @@ def git_commit() -> str:
         return run(["git", "-C", str(REPO), "rev-parse", "--short", "HEAD"]).stdout.strip()
     except (subprocess.CalledProcessError, FileNotFoundError):
         return "unknown"
+
+
+def pre_echo_db(ref: np.ndarray, deg: np.ndarray, sample_rate: int) -> float | None:
+    """Mean coding noise in the 10 ms before each attack, relative to the
+    attack's own energy over the next 10 ms, in dB (lower is better).
+
+    Attacks are 128-sample frames of the mono reference whose energy jumps by
+    more than 15 dB over the preceding ~20 ms; one per 60 ms at most. A
+    targeted proxy for pre-echo, which global metrics like ViSQOL barely
+    register. Returns None for clips without attacks.
+    """
+    x = ref.mean(axis=1).astype(np.float64)
+    y = deg.mean(axis=1).astype(np.float64)
+    frame, pre = 128, int(0.010 * sample_rate)
+    e = np.array([np.sum(x[i:i + frame] ** 2) for i in range(0, len(x) - frame, frame)]) + 1e-12
+    onsets: list[int] = []
+    for k in range(8, len(e)):
+        if 10 * np.log10(e[k] / np.mean(e[k - 7:k])) > 15 and (not onsets or k - onsets[-1] > 20):
+            onsets.append(k)
+    vals = []
+    for k in onsets:
+        s = k * frame
+        if s < pre or s + pre > len(x):
+            continue
+        noise = np.sum((y[s - pre:s] - x[s - pre:s]) ** 2)
+        sig = np.sum(x[s:s + pre] ** 2)
+        vals.append(10 * np.log10(noise / sig + 1e-20))
+    return float(np.mean(vals)) if vals else None

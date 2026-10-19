@@ -16,7 +16,8 @@
 //! see [`outer_loop`] and [`crate::NoiseShaping`]. LSF granules use the rate
 //! loop alone (their scalefactor coding differs; M8).
 
-use crate::huffman::{self, HuffmanPlan, MAX_BIG_VALUE};
+use crate::huffman::{self, HuffmanPlan, MAX_BIG_VALUE, Regions};
+use crate::mdct::Block;
 pub use crate::mdct::GRANULE_LINES;
 
 /// The decoder requantizes with `2^((global_gain − 210) / 4)` (published
@@ -37,11 +38,14 @@ pub const GLOBAL_GAIN_OFFSET: i32 = 210;
 /// slightly downwards, which we accept as Annex C does.
 const ROUNDING_OFFSET: f32 = 0.0946;
 
-/// Long-block scalefactor band boundaries for one sample rate.
+/// Scalefactor band boundaries for one sample rate, long and short.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScalefactorBands {
-    /// Start line of bands 0..=21, then 576.
+    /// Start line of long bands 0..=21, then 576.
     bounds: [usize; 23],
+    /// Width of short bands 0..=12 within one 192-line window (band 12 is
+    /// the remainder and has no scalefactor).
+    short_widths: [usize; 13],
 }
 
 /// Long-block band widths, bands 0..=20. MPEG-1: 11172-3 Table 3-B.8a–c
@@ -64,18 +68,46 @@ const WIDTHS_24000: [usize; 21] = [
     6, 6, 6, 6, 6, 6, 8, 10, 12, 14, 16, 18, 22, 26, 32, 38, 46, 54, 62, 70, 76,
 ];
 
+/// Short-block band widths, bands 0..=11 (11172-3 Table 3-B.8a–c, 13818-3
+/// Table B.2 short blocks; the LSF tables also list band 12, which here is
+/// derived as the remainder of the 192 lines for every rate).
+const SHORT_44100: [usize; 12] = [4, 4, 4, 4, 6, 8, 10, 12, 14, 18, 22, 30];
+const SHORT_48000: [usize; 12] = [4, 4, 4, 4, 6, 6, 10, 12, 14, 16, 20, 26];
+const SHORT_32000: [usize; 12] = [4, 4, 4, 4, 6, 8, 12, 16, 20, 26, 34, 42];
+const SHORT_22050: [usize; 12] = [4, 4, 4, 6, 6, 8, 10, 14, 18, 26, 32, 42];
+const SHORT_24000: [usize; 12] = [4, 4, 4, 6, 8, 10, 12, 14, 18, 24, 32, 44];
+const SHORT_16000: [usize; 12] = [4, 4, 4, 6, 8, 10, 12, 14, 18, 24, 30, 40];
+
+/// Scalefactor slots: 21 long bands, or 12 short bands × 3 windows.
+pub const MAX_SCALEFACS: usize = 36;
+
+/// The bands one granule is coded in, in coded order (11172-3 §2.4.2.7 and
+/// 13818-3 §2.5.2: long blocks by increasing frequency; short blocks by
+/// band, then window, then frequency).
+#[derive(Debug, Clone)]
+pub struct Layout<'a> {
+    pub short: bool,
+    /// `(first line, end line, scalefactor slot)` per band.
+    pub bands: Vec<(usize, usize, Option<usize>)>,
+    pub regions: Regions<'a>,
+}
+
 impl ScalefactorBands {
     /// Long-block bands for a sample rate, or `None` where no table is
     /// available (MPEG-2.5 rates, which no ISO standard defines).
-    pub fn long(sample_rate: u32) -> Option<Self> {
-        let widths = match sample_rate {
-            44_100 => &WIDTHS_44100,
-            48_000 => &WIDTHS_48000,
-            32_000 => &WIDTHS_32000,
-            22_050 | 16_000 => &WIDTHS_22050_16000,
-            24_000 => &WIDTHS_24000,
+    pub fn new(sample_rate: u32) -> Option<Self> {
+        let (widths, short) = match sample_rate {
+            44_100 => (&WIDTHS_44100, &SHORT_44100),
+            48_000 => (&WIDTHS_48000, &SHORT_48000),
+            32_000 => (&WIDTHS_32000, &SHORT_32000),
+            22_050 => (&WIDTHS_22050_16000, &SHORT_22050),
+            16_000 => (&WIDTHS_22050_16000, &SHORT_16000),
+            24_000 => (&WIDTHS_24000, &SHORT_24000),
             _ => return None,
         };
+        let mut short_widths = [0; 13];
+        short_widths[..12].copy_from_slice(short);
+        short_widths[12] = crate::mdct::SHORT_WINDOW_LINES - short.iter().sum::<usize>();
         let mut bounds = [GRANULE_LINES; 23];
         let mut pos = 0;
         for (b, w) in bounds.iter_mut().zip(widths) {
@@ -83,7 +115,73 @@ impl ScalefactorBands {
             pos += w;
         }
         bounds[21] = pos;
-        Some(Self { bounds })
+        Some(Self {
+            bounds,
+            short_widths,
+        })
+    }
+
+    /// The coding layout for a block type. Window-switched granules get the
+    /// implicit Huffman regions of 13818-3 §2.5.2: start/stop blocks
+    /// `region0_count` = 7 (region 1 from long band 8), short blocks 8
+    /// (region 1 from the 9th short band-window, i.e. short band 3).
+    pub fn layout(&self, block: Block) -> Layout<'_> {
+        if block != Block::Short {
+            return Layout {
+                short: false,
+                bands: (0..22)
+                    .map(|b| {
+                        (
+                            self.bounds[b],
+                            self.bounds[b + 1],
+                            (b < SCALEFAC_BANDS).then_some(b),
+                        )
+                    })
+                    .collect(),
+                regions: if block == Block::Normal {
+                    Regions::Search(&self.bounds)
+                } else {
+                    Regions::Fixed(self.bounds[8])
+                },
+            };
+        }
+        let mut bands = Vec::with_capacity(39);
+        let mut pos = 0;
+        for (sfb, &w) in self.short_widths.iter().enumerate() {
+            for window in 0..3 {
+                bands.push((pos, pos + w, (sfb < 12).then_some(3 * sfb + window)));
+                pos += w;
+            }
+        }
+        let region1 = bands[9].0;
+        Layout {
+            short: true,
+            bands,
+            regions: Regions::Fixed(region1),
+        }
+    }
+
+    /// Reorder a short block's window-major spectrum ([`Block::Short`]) into
+    /// coded order (band, window, frequency). Long blocks are already in
+    /// coded order.
+    pub fn to_coded_order(&self, xr: &[f32; GRANULE_LINES]) -> [f32; GRANULE_LINES] {
+        let mut out = [0.0f32; GRANULE_LINES];
+        let mut pos = 0;
+        let mut start = 0;
+        for &w in &self.short_widths {
+            for window in 0..3 {
+                let at = window * crate::mdct::SHORT_WINDOW_LINES + start;
+                out[pos..pos + w].copy_from_slice(&xr[at..at + w]);
+                pos += w;
+            }
+            start += w;
+        }
+        out
+    }
+
+    /// Short band widths within one window, bands 0..=12.
+    pub fn short_widths(&self) -> &[usize; 13] {
+        &self.short_widths
     }
 
     /// Band boundaries used for Huffman region splits: start of each band
@@ -120,12 +218,8 @@ pub struct QuantizedGranule {
 
 /// Inner (rate control) loop, Annex C.1.5.4 §4: find the smallest
 /// `global_gain` (finest quantizer) whose Huffman coding fits `max_bits`.
-pub fn rate_loop(
-    xr: &[f32; GRANULE_LINES],
-    bands: &ScalefactorBands,
-    max_bits: u32,
-) -> QuantizedGranule {
-    rate_loop_from(xr, bands, max_bits, None)
+pub fn rate_loop(xr: &[f32; GRANULE_LINES], regions: Regions, max_bits: u32) -> QuantizedGranule {
+    rate_loop_from(xr, regions, max_bits, None)
 }
 
 /// Smallest `global_gain` keeping every magnitude ≤ 8191 (Annex C.1.5.4
@@ -152,7 +246,7 @@ fn min_gain(xr: &[f32; GRANULE_LINES], ix: &mut [i32; GRANULE_LINES]) -> u8 {
 /// step coarser) in a handful of trials when the hint is close.
 pub fn rate_loop_from(
     xr: &[f32; GRANULE_LINES],
-    bands: &ScalefactorBands,
+    regions: Regions,
     max_bits: u32,
     hint: Option<u8>,
 ) -> QuantizedGranule {
@@ -160,7 +254,7 @@ pub fn rate_loop_from(
     let floor = min_gain(xr, &mut ix);
     let mut fits = |gg: u8| {
         quantize(xr, gg, &mut ix);
-        huffman::plan(&ix, bands).bits <= max_bits
+        huffman::plan(&ix, regions).bits <= max_bits
     };
 
     // Bracket the answer: `lo` known not to fit (or below the floor), `hi`
@@ -207,7 +301,7 @@ pub fn rate_loop_from(
     }
     let global_gain = hi as u8;
     quantize(xr, global_gain, &mut ix);
-    let plan = huffman::plan(&ix, bands);
+    let plan = huffman::plan(&ix, regions);
     QuantizedGranule {
         global_gain,
         ix,
@@ -397,7 +491,9 @@ impl Ath {
 #[derive(Debug, Clone)]
 pub struct CodedGranule {
     pub q: QuantizedGranule,
-    pub scalefac: [u8; SCALEFAC_BANDS],
+    /// Long blocks: bands 0..21. Short blocks: slot `3·band + window`.
+    pub scalefac: [u8; MAX_SCALEFACS],
+    pub short: bool,
     pub scalefac_compress: u8,
     pub scalefac_scale: bool,
     pub preflag: bool,
@@ -407,10 +503,11 @@ pub struct CodedGranule {
 
 impl CodedGranule {
     /// A granule coded by the rate loop alone (no scalefactors).
-    pub fn without_scalefactors(q: QuantizedGranule) -> Self {
+    pub fn without_scalefactors(q: QuantizedGranule, short: bool) -> Self {
         Self {
             q,
-            scalefac: [0; SCALEFAC_BANDS],
+            scalefac: [0; MAX_SCALEFACS],
+            short,
             scalefac_compress: 0,
             scalefac_scale: false,
             preflag: false,
@@ -422,71 +519,101 @@ impl CodedGranule {
     pub fn part2_3_length(&self) -> u32 {
         self.part2_length + self.q.plan.bits
     }
+
+    /// Transmitted scalefactors in syntax order with their bit widths
+    /// (11172-3 §2.4.1.7, scfsi = 0): long bands 0–10 at slen1 and 11–20 at
+    /// slen2; short bands 0–5 at slen1 and 6–11 at slen2, three windows each.
+    pub fn scalefactor_fields(&self) -> impl Iterator<Item = (u8, u8)> + '_ {
+        let (slen1, slen2) = SLEN[usize::from(self.scalefac_compress)];
+        let (n, split) = if self.short {
+            (MAX_SCALEFACS, 18)
+        } else {
+            (SCALEFAC_BANDS, 11)
+        };
+        self.scalefac[..n]
+            .iter()
+            .enumerate()
+            .map(move |(i, &v)| (v, if i < split { slen1 } else { slen2 }))
+    }
 }
 
-/// Amplification exponent (in powers of two) the decoder undoes in band `b`:
-/// `scalefac_multiplier · (scalefac + preflag · pretab)` (11172-3 §2.4.3.4;
-/// multiplier 0.5 or 1 per 13818-3 §2.5.2 `scalefac_scale`).
-fn band_exponent(sf: &[u8; SCALEFAC_BANDS], b: usize, scale: bool, preflag: bool) -> f32 {
-    if b >= SCALEFAC_BANDS {
-        return 0.0;
-    }
-    let mult = if scale { 1.0 } else { 0.5 };
-    mult * f32::from(sf[b] + if preflag { PRETAB[b] } else { 0 })
+/// Amplification exponent (in powers of two) the decoder undoes for
+/// scalefactor slot `slot`: `scalefac_multiplier · (scalefac + preflag ·
+/// pretab)` (11172-3 §2.4.3.4; multiplier 0.5 or 1 per 13818-3 §2.5.2
+/// `scalefac_scale`; pretab applies to long blocks only).
+fn slot_exponent(c: &CodedGranule, slot: Option<usize>) -> f32 {
+    let Some(i) = slot else { return 0.0 };
+    let mult = if c.scalefac_scale { 1.0 } else { 0.5 };
+    let pre = if c.preflag && !c.short { PRETAB[i] } else { 0 };
+    mult * f32::from(c.scalefac[i] + pre)
 }
 
 /// Mean squared quantization error per line in each band, measured in the
 /// original (unamplified) domain against what the decoder reconstructs
 /// (Annex C.1.5.4 §3.3, `xfsf`).
-fn band_noise(xr: &[f32; GRANULE_LINES], c: &CodedGranule, bands: &ScalefactorBands) -> [f32; 22] {
-    let b = bands.region_bounds();
+fn band_noise(xr: &[f32; GRANULE_LINES], c: &CodedGranule, layout: &Layout) -> Vec<f32> {
     let step = 2f32.powf((i32::from(c.q.global_gain) - GLOBAL_GAIN_OFFSET) as f32 / 4.0);
-    std::array::from_fn(|band| {
-        let gain = step
-            * 2f32.powf(-band_exponent(
-                &c.scalefac,
-                band,
-                c.scalefac_scale,
-                c.preflag,
-            ));
-        let (lo, hi) = (b[band], b[band + 1]);
-        let sum: f32 = (lo..hi)
-            .map(|i| {
-                let rec = (c.q.ix[i].unsigned_abs() as f32).powf(4.0 / 3.0) * gain;
-                (xr[i].abs() - rec).powi(2)
-            })
-            .sum();
-        sum / (hi - lo) as f32
-    })
+    layout
+        .bands
+        .iter()
+        .map(|&(lo, hi, slot)| {
+            let gain = step * 2f32.powf(-slot_exponent(c, slot));
+            let sum: f32 = (lo..hi)
+                .map(|i| {
+                    let rec = (c.q.ix[i].unsigned_abs() as f32).powf(4.0 / 3.0) * gain;
+                    (xr[i].abs() - rec).powi(2)
+                })
+                .sum();
+            sum / (hi - lo) as f32
+        })
+        .collect()
 }
 
 /// Noise-to-threshold ratio per band, in dB (positive = audible).
-fn excess_db(noise: &[f32; 22], xmin: &[f32; 22]) -> [f32; 22] {
-    std::array::from_fn(|b| 10.0 * (noise[b].max(1e-30) / xmin[b].max(1e-30)).log10())
+fn excess_db(noise: &[f32], xmin: &[f32]) -> Vec<f32> {
+    noise
+        .iter()
+        .zip(xmin)
+        .map(|(n, x)| 10.0 * (n.max(1e-30) / x.max(1e-30)).log10())
+        .collect()
 }
 
-/// Largest noise-to-threshold excess of a granule, in dB. Lower is better.
-fn worst_excess(excess: &[f32; 22]) -> f32 {
-    excess.iter().copied().fold(f32::NEG_INFINITY, f32::max)
-}
-
-/// Transmitted scalefactors for a total per-band amplification `t` (in
-/// scalefactor steps): `scalefac = t − preflag · pretab`.
+/// Transmitted scalefactors for a total per-slot amplification `t` (in
+/// scalefactor steps), with `preflag`, `scalefac_compress` and part2 length.
 ///
-/// original: `preflag` is used purely as compression. The decoder adds
-/// `pretab` (Table 3-B.6) to the scalefactors when it is set, so whenever `t`
-/// already contains the pretab shape, sending `t − pretab` with `preflag` = 1
-/// gives the same amplification. Whichever form has the shorter part2 wins.
-/// Returns `None` if neither form fits the scalefactor fields (15 for bands
-/// 0–10, 7 for bands 11–20).
-fn represent(t: &[u8; SCALEFAC_BANDS]) -> Option<([u8; SCALEFAC_BANDS], bool, u8, u32)> {
-    let plain = choose_scalefac_compress(t).map(|(c, bits)| (*t, false, c, bits));
-    let with_pretab = t
+/// Long blocks: `scalefac = t − preflag · pretab`. original: `preflag` is
+/// used purely as compression. The decoder adds `pretab` (Table 3-B.6) when
+/// it is set, so whenever `t` already contains the pretab shape, sending
+/// `t − pretab` with `preflag` = 1 gives the same amplification; whichever
+/// form has the shorter part2 wins. Short blocks never use `preflag`
+/// (13818-3 §2.5.2); their part2 is `18·slen1 + 18·slen2` (11172-3 §2.4.2.7).
+/// Returns `None` if no form fits the fields (15 for the first group, 7 for
+/// the second).
+fn represent(t: &[u8; MAX_SCALEFACS], short: bool) -> Option<([u8; MAX_SCALEFACS], bool, u8, u32)> {
+    if short {
+        let need = |r: std::ops::Range<usize>| {
+            (u8::BITS - t[r].iter().copied().max().unwrap_or(0).leading_zeros()) as u8
+        };
+        let (n1, n2) = (need(0..18), need(18..36));
+        return SLEN
+            .iter()
+            .enumerate()
+            .filter(|&(_, &(s1, s2))| s1 >= n1 && s2 >= n2)
+            .map(|(i, &(s1, s2))| (i as u8, 18 * u32::from(s1) + 18 * u32::from(s2)))
+            .min_by_key(|&(_, bits)| bits)
+            .map(|(c, bits)| (*t, false, c, bits));
+    }
+    let long: [u8; SCALEFAC_BANDS] = std::array::from_fn(|i| t[i]);
+    let widen = |sf: [u8; SCALEFAC_BANDS]| {
+        std::array::from_fn(|i| if i < SCALEFAC_BANDS { sf[i] } else { 0 })
+    };
+    let plain = choose_scalefac_compress(&long).map(|(c, bits)| (widen(long), false, c, bits));
+    let with_pretab = long
         .iter()
         .zip(&PRETAB)
         .all(|(&v, &p)| v >= p)
-        .then(|| std::array::from_fn(|b| t[b] - PRETAB[b]))
-        .and_then(|sf| choose_scalefac_compress(&sf).map(|(c, bits)| (sf, true, c, bits)));
+        .then(|| std::array::from_fn(|b| long[b] - PRETAB[b]))
+        .and_then(|sf| choose_scalefac_compress(&sf).map(|(c, bits)| (widen(sf), true, c, bits)));
     match (plain, with_pretab) {
         (Some(a), Some(b)) => Some(if b.3 < a.3 { b } else { a }),
         (a, b) => a.or(b),
@@ -497,22 +624,25 @@ fn represent(t: &[u8; SCALEFAC_BANDS]) -> Option<([u8; SCALEFAC_BANDS], bool, u8
 /// normally ends earlier on convergence (see `outer_loop`).
 const MAX_OUTER_ITERATIONS: usize = 32;
 
-/// Outer (distortion control) loop, Annex C.1.5.4 §3, long blocks.
+/// Outer (distortion control) loop, Annex C.1.5.4 §3.
 ///
-/// Repeatedly quantizes with the rate loop, measures each band's noise
-/// against the allowed distortion `xmin` (mean noise energy per line, bands
-/// 0..=21), and amplifies (raises the scalefactor of) bands.
+/// `xr` is in coded order for `layout` (see [`ScalefactorBands::layout`]);
+/// `xmin` is the allowed distortion (mean noise energy per line) per layout
+/// band. Repeatedly quantizes with the rate loop, measures each band's noise,
+/// and amplifies (raises the scalefactor of) bands.
 ///
 /// As in §3.5, every band whose noise exceeds the allowed distortion is
-/// amplified by one step per iteration. original refinements: the smallest
-/// amplification is kept at zero, because amplifying every band equally is
-/// undone by the rate loop raising `global_gain` and only costs scalefactor
-/// bits; consequently the loop stops as soon as an iteration would change
-/// nothing (e.g. every band is over the threshold, typical at 128 kbps with
-/// the absolute threshold alone), as well as when all bands are under it,
-/// after three iterations without improvement, or at the field-size limit.
-/// Of all iterations, the one with the smallest worst-band noise-to-threshold
-/// ratio is kept, rather than only the last saved one (§3.1).
+/// amplified by one step per iteration (short blocks: each band-window has
+/// its own scalefactor, the "outer-loop variant" of docs/PLAN.md M6).
+/// original refinements: the smallest amplification is kept at zero,
+/// because amplifying every band equally is undone by the rate loop raising
+/// `global_gain` and only costs scalefactor bits; consequently the loop stops
+/// as soon as an iteration would change nothing (e.g. every band is over the
+/// threshold), as well as when all bands are under it, after three
+/// iterations without improvement, or at the field-size limit. Of all
+/// iterations, the one with the smallest worst-band noise-to-threshold ratio
+/// is kept, rather than only the last saved one (§3.1). `subblock_gain` is
+/// not used (always 0).
 ///
 /// Evaluation (2026-10-19, `eval/results/m4-annex.json` vs `m3-baseline`):
 /// with the absolute threshold as the allowed distortion this loop does not
@@ -532,15 +662,16 @@ const MAX_OUTER_ITERATIONS: usize = 32;
 /// limit, again with `scalefac_scale` = 1 (2× steps); the better is kept.
 pub fn outer_loop(
     xr: &[f32; GRANULE_LINES],
-    bands: &ScalefactorBands,
-    xmin: &[f32; 22],
+    layout: &Layout,
+    xmin: &[f32],
     max_bits: u32,
 ) -> CodedGranule {
-    let (fine, fine_score, hit_limit) = outer_loop_with_scale(xr, bands, xmin, max_bits, false);
+    assert_eq!(xmin.len(), layout.bands.len());
+    let (fine, fine_score, hit_limit) = outer_loop_with_scale(xr, layout, xmin, max_bits, false);
     if !hit_limit {
         return fine;
     }
-    let (coarse, coarse_score, _) = outer_loop_with_scale(xr, bands, xmin, max_bits, true);
+    let (coarse, coarse_score, _) = outer_loop_with_scale(xr, layout, xmin, max_bits, true);
     if coarse_score < fine_score {
         coarse
     } else {
@@ -552,45 +683,59 @@ pub fn outer_loop(
 /// iteration, its worst-band excess, and whether the field limit was hit.
 fn outer_loop_with_scale(
     xr: &[f32; GRANULE_LINES],
-    bands: &ScalefactorBands,
-    xmin: &[f32; 22],
+    layout: &Layout,
+    xmin: &[f32],
     max_bits: u32,
     scale: bool,
 ) -> (CodedGranule, f32, bool) {
-    let bounds = bands.region_bounds();
-    let mut t = [0u8; SCALEFAC_BANDS];
+    let slots = if layout.short {
+        MAX_SCALEFACS
+    } else {
+        SCALEFAC_BANDS
+    };
+    let mut t = [0u8; MAX_SCALEFACS];
     let mut hint = None;
     let mut best: Option<(CodedGranule, f32)> = None;
     let mut stall = 0;
     let mut hit_limit = false;
     for _ in 0..MAX_OUTER_ITERATIONS {
-        let floor = t.iter().copied().min().unwrap_or(0);
-        t.iter_mut().for_each(|v| *v -= floor);
-        let Some((scalefac, preflag, scalefac_compress, part2_length)) = represent(&t) else {
+        let floor = t[..slots].iter().copied().min().unwrap_or(0);
+        t[..slots].iter_mut().for_each(|v| *v -= floor);
+        let Some((scalefac, preflag, scalefac_compress, part2_length)) =
+            represent(&t, layout.short)
+        else {
             hit_limit = true;
             break;
         };
-        // Amplify each band by 2^exponent before quantizing; the decoder
-        // divides it back out (Annex C.1.5.4 §3).
-        let mut amp = *xr;
-        for band in 0..SCALEFAC_BANDS {
-            let g = 2f32.powf(band_exponent(&scalefac, band, scale, preflag));
-            for v in &mut amp[bounds[band]..bounds[band + 1]] {
-                *v *= g;
-            }
-        }
-        let q = rate_loop_from(&amp, bands, max_bits.saturating_sub(part2_length), hint);
-        hint = Some(q.global_gain);
-        let coded = CodedGranule {
-            q,
+        let mut coded = CodedGranule {
+            q: QuantizedGranule {
+                global_gain: 0,
+                ix: [0; GRANULE_LINES],
+                plan: HuffmanPlan::default(),
+            },
             scalefac,
+            short: layout.short,
             scalefac_compress,
             scalefac_scale: scale,
             preflag,
             part2_length,
         };
-        let excess = excess_db(&band_noise(xr, &coded, bands), xmin);
-        let score = worst_excess(&excess);
+        // Amplify each band by 2^exponent before quantizing; the decoder
+        // divides it back out (Annex C.1.5.4 §3).
+        let mut amp = *xr;
+        for &(lo, hi, slot) in &layout.bands {
+            let g = 2f32.powf(slot_exponent(&coded, slot));
+            amp[lo..hi].iter_mut().for_each(|v| *v *= g);
+        }
+        coded.q = rate_loop_from(
+            &amp,
+            layout.regions,
+            max_bits.saturating_sub(part2_length),
+            hint,
+        );
+        hint = Some(coded.q.global_gain);
+        let excess = excess_db(&band_noise(xr, &coded, layout), xmin);
+        let score = excess.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         if best.as_ref().is_none_or(|(_, s)| score < *s - 0.01) {
             best = Some((coded, score));
             stall = 0;
@@ -600,22 +745,26 @@ fn outer_loop_with_scale(
                 break;
             }
         }
-        let worst = excess[..SCALEFAC_BANDS]
+        let over: Vec<usize> = layout
+            .bands
             .iter()
-            .copied()
-            .fold(f32::NEG_INFINITY, f32::max);
-        if worst <= 0.0 {
+            .zip(&excess)
+            .filter_map(|(&(_, _, slot), &e)| slot.filter(|_| e > 0.0))
+            .collect();
+        if over.is_empty() {
             break; // every band with a scalefactor is under the threshold
         }
         let before = t;
-        for (v, &e) in t.iter_mut().zip(&excess) {
-            if e > 0.0 {
-                *v += 1;
-            }
+        for i in over {
+            t[i] += 1;
         }
         // Amplifying every band equally is a no-op once normalised.
-        let floor = t.iter().copied().min().unwrap_or(0);
-        if t.iter().zip(&before).all(|(&a, &b)| a - floor == b) {
+        let floor = t[..slots].iter().copied().min().unwrap_or(0);
+        if t[..slots]
+            .iter()
+            .zip(&before[..slots])
+            .all(|(&a, &b)| a - floor == b)
+        {
             break;
         }
     }
@@ -637,14 +786,14 @@ mod tests {
             (24_000, 540),
             (16_000, 522),
         ] {
-            let b = ScalefactorBands::long(rate).unwrap();
+            let b = ScalefactorBands::new(rate).unwrap();
             let r = b.region_bounds();
             assert_eq!(r[0], 0);
             assert_eq!(r[21], last_end, "{rate}: start of band 21");
             assert_eq!(r[22], 576);
             assert!(r.windows(2).all(|w| w[0] < w[1]), "{rate}");
         }
-        assert!(ScalefactorBands::long(11_025).is_none());
+        assert!(ScalefactorBands::new(11_025).is_none());
     }
 
     #[test]
@@ -701,13 +850,13 @@ mod tests {
 
     #[test]
     fn rate_loop_meets_budget() {
-        let bands = ScalefactorBands::long(44_100).unwrap();
+        let bands = ScalefactorBands::new(44_100).unwrap();
         let mut xr = [0.0f32; GRANULE_LINES];
         for (i, x) in xr.iter_mut().enumerate() {
             *x = 0.05 * ((i * 7919 % 1000) as f32 / 500.0 - 1.0) / (1.0 + i as f32 / 50.0);
         }
         for budget in [200u32, 800, 2000, 4000] {
-            let q = rate_loop(&xr, &bands, budget);
+            let q = rate_loop(&xr, Regions::Search(bands.region_bounds()), budget);
             assert!(
                 q.plan.bits <= budget,
                 "budget {budget}: {} bits",
@@ -717,7 +866,7 @@ mod tests {
             if q.global_gain > 0 {
                 let mut ix = [0; GRANULE_LINES];
                 if quantize(&xr, q.global_gain - 1, &mut ix) <= MAX_BIG_VALUE {
-                    let finer = huffman::plan(&ix, &bands);
+                    let finer = huffman::plan(&ix, Regions::Search(bands.region_bounds()));
                     assert!(
                         finer.bits > budget,
                         "budget {budget}: gain {} not minimal",
@@ -761,13 +910,13 @@ mod tests {
     fn ath_spot_values() {
         // 44.1 kHz band 0 spans FFT lines ~0.4–3.1, whose lowest threshold
         // in Table 3-D.4b is 18.70 dB (line 3); band 0 has 4 lines.
-        let bands = ScalefactorBands::long(44_100).unwrap();
+        let bands = ScalefactorBands::new(44_100).unwrap();
         let ath = Ath::new(44_100, &bands).unwrap();
         let expect = 10f32.powf((18.70 - 96.0) / 10.0) / 4.0;
         assert!((ath.xmin(0) / expect - 1.0).abs() < 1e-4);
         // Mid bands are far more sensitive than the top band.
         assert!(ath.xmin(10) < ath.xmin(21) / 1000.0);
-        assert!(Ath::new(22_050, &ScalefactorBands::long(22_050).unwrap()).is_none());
+        assert!(Ath::new(22_050, &ScalefactorBands::new(22_050).unwrap()).is_none());
     }
 
     #[test]
@@ -787,66 +936,160 @@ mod tests {
 
     #[test]
     fn preflag_used_when_cheaper() {
+        let widen = |v: [u8; SCALEFAC_BANDS]| -> [u8; MAX_SCALEFACS] {
+            std::array::from_fn(|i| if i < SCALEFAC_BANDS { v[i] } else { 0 })
+        };
         // t equal to pretab: sending zeros with preflag costs 0 bits.
-        let (sf, preflag, compress, bits) = represent(&PRETAB).unwrap();
+        let (sf, preflag, compress, bits) = represent(&widen(PRETAB), false).unwrap();
         assert!(preflag);
-        assert_eq!((sf, compress, bits), ([0; SCALEFAC_BANDS], 0, 0));
+        assert_eq!((sf, compress, bits), ([0; MAX_SCALEFACS], 0, 0));
         // A band below pretab rules preflag out.
         let mut t = PRETAB;
         t[17] = 0;
-        assert!(!represent(&t).unwrap().1);
+        assert!(!represent(&widen(t), false).unwrap().1);
         // Too large for any field either way.
         let mut t = [0u8; SCALEFAC_BANDS];
         t[12] = 11;
-        assert!(represent(&t).is_none());
+        assert!(represent(&widen(t), false).is_none());
     }
 
     #[test]
-    fn outer_loop_shapes_noise_and_matches_decoder() {
-        use crate::refdec::requantize_long;
-        let bands = ScalefactorBands::long(44_100).unwrap();
-        let ath = Ath::new(44_100, &bands).unwrap();
-        // Loud low band, very quiet high band: a budget that leaves the low
-        // band over the threshold makes the loop amplify it.
-        let mut xr = [0.0f32; GRANULE_LINES];
-        for (i, x) in xr.iter_mut().enumerate() {
-            let level = if i < 100 { 0.05 } else { 1e-5 };
-            *x = level * ((i as f32 * 1.7).sin() + 0.3);
-        }
-        let c = outer_loop(&xr, &bands, &ath.xmin_all(), 1500);
-        assert!(c.part2_3_length() <= 1500);
-        assert!(
-            c.scalefac.iter().any(|&v| v > 0) || c.preflag,
-            "no shaping happened"
-        );
-        let (slen1, slen2) = SLEN[usize::from(c.scalefac_compress)];
+    fn short_scalefactor_fields() {
+        // Short blocks: bands 0–5 (slots 0..18) at slen1, 6–11 (18..36) at
+        // slen2, part2 = 18·slen1 + 18·slen2, never preflag.
+        let mut t = [0u8; MAX_SCALEFACS];
+        t[17] = 3; // slen1 >= 2
+        t[18] = 1; // slen2 >= 1
+        let (_, preflag, compress, bits) = represent(&t, true).unwrap();
+        assert!(!preflag);
+        assert_eq!(SLEN[usize::from(compress)], (2, 1));
+        assert_eq!(bits, 18 * 2 + 18);
+        t[35] = 8;
+        assert!(represent(&t, true).is_none());
+    }
+
+    #[test]
+    fn short_layout_and_reorder() {
+        let bands = ScalefactorBands::new(44_100).unwrap();
+        let layout = bands.layout(Block::Short);
+        assert_eq!(layout.bands.len(), 39);
+        // Band 0 of windows 0,1,2 come first, 4 lines each.
         assert_eq!(
-            c.part2_length,
-            11 * u32::from(slen1) + 10 * u32::from(slen2)
+            &layout.bands[..3],
+            &[(0, 4, Some(0)), (4, 8, Some(1)), (8, 12, Some(2))]
         );
-        // The decoder's reconstruction (independent formula) must match the
-        // noise the encoder measured.
-        let rec = requantize_long(
-            &c.q.ix,
-            c.q.global_gain,
-            &c.scalefac,
-            c.preflag,
-            c.scalefac_scale,
-            bands.region_bounds(),
-        );
-        let ours = band_noise(&xr, &c, &bands);
-        let b = bands.region_bounds();
-        for band in 0..22 {
-            let (lo, hi) = (b[band], b[band + 1]);
+        assert_eq!(layout.bands[38], (576 - 56, 576, None)); // band 12 remainder, window 2
+        assert!(matches!(layout.regions, Regions::Fixed(36)));
+        assert!(matches!(
+            bands.layout(Block::Start).regions,
+            Regions::Fixed(36)
+        ));
+        // Window-major line f of window w lands inside its (band, window).
+        let mut xr = [0.0f32; GRANULE_LINES];
+        for w in 0..3 {
+            for f in 0..192 {
+                xr[w * 192 + f] = (w * 1000 + f) as f32;
+            }
+        }
+        let coded = bands.to_coded_order(&xr);
+        for &(lo, hi, slot) in &layout.bands {
+            if let Some(slot) = slot {
+                let (sfb, w) = (slot / 3, slot % 3);
+                let start: usize = bands.short_widths()[..sfb].iter().sum();
+                for (k, &v) in coded[lo..hi].iter().enumerate() {
+                    assert_eq!(v, (w * 1000 + start + k) as f32);
+                }
+            }
+        }
+    }
+
+    /// Run the outer loop and check its noise measurement against an
+    /// independent decoder requantizer.
+    fn check_against_decoder(
+        block: Block,
+        xr: &[f32; GRANULE_LINES],
+        bands: &ScalefactorBands,
+    ) -> CodedGranule {
+        use crate::refdec::{requantize_long, requantize_short};
+        let layout = bands.layout(block);
+        // A fixed allowed distortion per line: the loud bands end up over
+        // it and the quiet ones under, so the loop must shape.
+        let xmin = vec![3e-6f32; layout.bands.len()];
+        let c = outer_loop(xr, &layout, &xmin, 1500);
+        assert!(c.part2_3_length() <= 1500);
+        let rec = if block == Block::Short {
+            requantize_short(
+                &c.q.ix,
+                c.q.global_gain,
+                [0; 3],
+                &c.scalefac,
+                c.scalefac_scale,
+                bands.short_widths(),
+            )
+        } else {
+            let sf: [u8; 21] = std::array::from_fn(|i| c.scalefac[i]);
+            requantize_long(
+                &c.q.ix,
+                c.q.global_gain,
+                &sf,
+                c.preflag,
+                c.scalefac_scale,
+                bands.region_bounds(),
+            )
+        };
+        let ours = band_noise(xr, &c, &layout);
+        for (k, &(lo, hi, _)) in layout.bands.iter().enumerate() {
             let n: f64 = (lo..hi)
                 .map(|i| (f64::from(xr[i]) - rec[i]).powi(2))
                 .sum::<f64>()
                 / (hi - lo) as f64;
-            let m = f64::from(ours[band]);
+            let m = f64::from(ours[k]);
             assert!(
                 (n - m).abs() <= 1e-3 * n.max(m) + 1e-20,
-                "band {band}: decoder {n} vs encoder {m}"
+                "{block:?} band {k}: decoder {n} vs encoder {m}"
             );
         }
+        c
+    }
+
+    #[test]
+    fn outer_loop_shapes_noise_and_matches_decoder() {
+        let bands = ScalefactorBands::new(44_100).unwrap();
+        // Loud low band, very quiet high band.
+        let mut xr = [0.0f32; GRANULE_LINES];
+        for (i, x) in xr.iter_mut().enumerate() {
+            let level = if i < 100 { 0.5 } else { 1e-3 };
+            *x = level * ((i as f32 * 1.7).sin() + 0.3);
+        }
+        for block in [Block::Normal, Block::Start, Block::Stop] {
+            let c = check_against_decoder(block, &xr, &bands);
+            assert!(
+                c.scalefac.iter().any(|&v| v > 0) || c.preflag,
+                "{block:?}: no shaping happened"
+            );
+            let (slen1, slen2) = SLEN[usize::from(c.scalefac_compress)];
+            assert_eq!(
+                c.part2_length,
+                11 * u32::from(slen1) + 10 * u32::from(slen2)
+            );
+        }
+        // Short block: coded order, a loud window 1 among quiet ones.
+        let mut xs = [0.0f32; GRANULE_LINES];
+        for (i, x) in xs.iter_mut().enumerate() {
+            *x = 1e-3 * ((i as f32 * 2.3).sin() + 0.2);
+        }
+        let layout = bands.layout(Block::Short);
+        for &(lo, hi, slot) in &layout.bands {
+            if slot.is_some_and(|s| s % 3 == 1) && lo < 200 {
+                xs[lo..hi].iter_mut().for_each(|v| *v *= 500.0);
+            }
+        }
+        let c = check_against_decoder(Block::Short, &xs, &bands);
+        assert!(c.short && !c.preflag);
+        let (slen1, slen2) = SLEN[usize::from(c.scalefac_compress)];
+        assert_eq!(
+            c.part2_length,
+            18 * u32::from(slen1) + 18 * u32::from(slen2)
+        );
     }
 }

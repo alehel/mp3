@@ -28,7 +28,7 @@ use header::{ChannelMode, FrameHeader, PaddingState, StreamParams, Version};
 use mdct::{Block, GRANULE_SAMPLES, HybridFilterbank};
 use psy::PsyModel;
 use quantize::{Ath, CodedGranule, ScalefactorBands};
-use sideinfo::{GranuleInfo, SideInfo, Window};
+use sideinfo::{BlockType, GranuleInfo, SideInfo, Window};
 
 /// Errors produced by the encoder and its I/O helpers.
 #[derive(Debug)]
@@ -162,6 +162,14 @@ pub struct Encoder {
     /// The last [`psy::HISTORY`] samples before `pending`, per coded channel
     /// (zeros at the start of the stream).
     history: Vec<Vec<f32>>,
+    /// Psychoacoustic result for each channel's next granule, computed one
+    /// granule ahead so a start block can precede an attack.
+    lookahead: Vec<Option<psy::PsyResult>>,
+    /// Block type of each channel's previous granule.
+    prev_block: Vec<Block>,
+    /// Test hook: treat every granule as an attack (start, then short
+    /// blocks throughout).
+    force_short: bool,
     /// Input samples per channel received so far, and samples coded.
     samples_in: usize,
     samples_coded: usize,
@@ -182,7 +190,7 @@ impl Encoder {
                 "MPEG-2.5 (no standard scalefactor band tables; optional in M8)",
             ));
         }
-        let bands = ScalefactorBands::long(config.sample_rate)
+        let bands = ScalefactorBands::new(config.sample_rate)
             .ok_or(Error::UnsupportedSampleRate(config.sample_rate))?;
         let mode = match (config.channels, config.stereo) {
             (1, _) | (_, StereoMode::Mono) => ChannelMode::Mono,
@@ -210,6 +218,9 @@ impl Encoder {
                 _ => Vec::new(),
             },
             history: vec![vec![0.0; psy::HISTORY]; mode.channels()],
+            lookahead: vec![None; mode.channels()],
+            prev_block: vec![Block::Normal; mode.channels()],
+            force_short: false,
             bands,
             samples_in: 0,
             samples_coded: 0,
@@ -253,10 +264,15 @@ impl Encoder {
         Ok(self.drain_frames())
     }
 
-    /// Code every whole frame of pending samples.
+    /// Samples past the end of a frame that must be buffered before it can
+    /// be coded: the long psychoacoustic window of the following granule
+    /// (block-switching lookahead) ends this far into the next frame.
+    const LOOKAHEAD: usize = (psy::LONG_WINDOW_START + psy::LONG_FFT as isize) as usize;
+
+    /// Code every whole frame of pending samples that has its lookahead.
     fn drain_frames(&mut self) -> Vec<u8> {
         let spf = self.params.version.samples_per_frame();
-        let frames = self.pending[0].len() / spf;
+        let frames = self.pending[0].len().saturating_sub(Self::LOOKAHEAD) / spf;
         let mut out = Vec::with_capacity(frames * self.params.frame_bytes(true));
         for f in 0..frames {
             self.write_frame(f * spf, &mut out);
@@ -283,17 +299,77 @@ impl Encoder {
         }
         let spf = self.params.version.samples_per_frame();
         let target = (self.samples_in + HybridFilterbank::DELAY).div_ceil(spf) * spf;
-        let pad = target - self.samples_coded - self.pending[0].len();
+        let pad = target + Self::LOOKAHEAD - self.samples_coded - self.pending[0].len();
         for buf in &mut self.pending {
             buf.resize(buf.len() + pad, 0.0);
         }
         Ok(self.drain_frames())
     }
 
+    /// Block type for a channel's granule at `start` (an index into
+    /// `pending`) and the psychoacoustic results that go with it: long-block
+    /// ratios, and short-block ratios when the granule is short.
+    ///
+    /// The window-switching state machine of Annex C.1.5.3 (figure in
+    /// "Window switching decision"): normal or stop → start on an attack;
+    /// start → short; short stays short while there is an attack, else stop.
+    /// An "attack" is a perceptual entropy above [`psy::PE_SWITCH`]. original:
+    /// a start block has to precede the short ones, so the decision looks at
+    /// the *next* granule's attack (one granule of lookahead); a short run
+    /// continues while either this or the next granule has an attack.
+    fn analyze(
+        &mut self,
+        ch: usize,
+        start: usize,
+    ) -> (Block, Option<psy::PsyResult>, Option<[[f32; 13]; 3]>) {
+        let Some(model) = self.psy.get_mut(ch) else {
+            return (Block::Normal, None, None);
+        };
+        let (hist, buf) = (&self.history[ch], &self.pending[ch]);
+        let window = |at: usize, rel: isize, len: usize| -> Vec<f32> {
+            (0..len)
+                .map(|i| {
+                    let idx = at as isize + rel + i as isize;
+                    if idx < 0 {
+                        hist[(psy::HISTORY as isize + idx) as usize]
+                    } else {
+                        buf[idx as usize]
+                    }
+                })
+                .collect()
+        };
+        let mut run = |at: usize| {
+            let long = window(at, psy::LONG_WINDOW_START, psy::LONG_FFT);
+            let s = psy::SHORT_WINDOW_STARTS.map(|st| window(at, st, psy::SHORT_FFT));
+            model.analyze(&long, [&s[0], &s[1], &s[2]])
+        };
+        let now = self.lookahead[ch].take().unwrap_or_else(|| run(start));
+        let next = run(start + GRANULE_SAMPLES);
+        self.lookahead[ch] = Some(next);
+        let (attack_now, attack_next) = if self.force_short {
+            (true, true)
+        } else {
+            (now.pe > psy::PE_SWITCH, next.pe > psy::PE_SWITCH)
+        };
+        let block = match self.prev_block[ch] {
+            Block::Start => Block::Short,
+            Block::Short if attack_now || attack_next => Block::Short,
+            Block::Short => Block::Stop,
+            _ if attack_next => Block::Start,
+            _ => Block::Normal,
+        };
+        self.prev_block[ch] = block;
+        let short = (block == Block::Short).then(|| {
+            let w = psy::SHORT_THRESHOLD_STARTS.map(|st| window(start, st, psy::SHORT_FFT));
+            self.psy[ch].analyze_short([&w[0], &w[1], &w[2]])
+        });
+        (block, Some(now), short)
+    }
+
     /// Append one frame coding `samples_per_frame` pending samples starting
     /// at `offset`.
     ///
-    /// M3: no bit reservoir (`main_data_begin` = 0), so each frame's main
+    /// No bit reservoir yet (`main_data_begin` = 0), so each frame's main
     /// data must fit in the frame itself. The space after the header and side
     /// information is split evenly between granules and channels; unused
     /// bits at the end are zero ancillary data (11172-3 §2.4.1.7).
@@ -313,60 +389,70 @@ impl Encoder {
         for gr in 0..version.granules() {
             for ch in 0..channels {
                 let start = offset + gr * GRANULE_SAMPLES;
+                let (block, psy_long, psy_short) = self.analyze(ch, start);
                 let pcm: &[f32; GRANULE_SAMPLES] = self.pending[ch][start..start + GRANULE_SAMPLES]
                     .try_into()
                     .expect("whole granule");
-                self.filterbanks[ch].granule(pcm, Block::Normal, &mut xr);
-                let xmin = if let Some(model) = self.psy.get_mut(ch) {
-                    // Windows reach back before the granule into `history`.
-                    let (hist, buf) = (&self.history[ch], &self.pending[ch]);
-                    let window = |rel: isize, len: usize| -> Vec<f32> {
-                        (0..len)
-                            .map(|i| {
-                                let idx = start as isize + rel + i as isize;
-                                if idx < 0 {
-                                    hist[(psy::HISTORY as isize + idx) as usize]
-                                } else {
-                                    buf[idx as usize]
-                                }
-                            })
-                            .collect()
-                    };
-                    let long = window(psy::LONG_WINDOW_START, psy::LONG_FFT);
-                    let s = psy::SHORT_WINDOW_STARTS.map(|st| window(st, psy::SHORT_FFT));
-                    let res = model.analyze(&long, [&s[0], &s[1], &s[2]]);
-                    // original: the model's ratio is masking threshold over
-                    // signal energy per scalefactor band; applied to the
-                    // band's energy in our frequency lines it gives the
-                    // allowed noise, as a mean per line like the outer loop's
-                    // distortion measure (Annex C.1.5.4 §3.3).
-                    let b = self.bands.region_bounds();
-                    Some(std::array::from_fn(|sb| {
-                        let e: f32 = xr[b[sb]..b[sb + 1]].iter().map(|v| v * v).sum();
-                        res.ratio[sb] * e / (b[sb + 1] - b[sb]) as f32
-                    }))
+                self.filterbanks[ch].granule(pcm, block, &mut xr);
+                let layout = self.bands.layout(block);
+                let xr = if block == Block::Short {
+                    self.bands.to_coded_order(&xr)
                 } else {
-                    self.ath.as_ref().map(Ath::xmin_all)
+                    xr
+                };
+                // original: the model's ratio is masking threshold over signal
+                // energy per band; applied to the band's energy in our
+                // frequency lines it gives the allowed noise, as a mean per
+                // line like the outer loop's distortion measure (Annex
+                // C.1.5.4 §3.3). Short bands are (band, window) pairs.
+                let band_xmin = |k: usize, ratio: f32| -> f32 {
+                    let (lo, hi, _) = layout.bands[k];
+                    ratio * xr[lo..hi].iter().map(|v| v * v).sum::<f32>() / (hi - lo) as f32
+                };
+                let xmin: Option<Vec<f32>> = match (psy_long, psy_short) {
+                    (_, Some(short)) => Some(
+                        (0..layout.bands.len())
+                            .map(|k| band_xmin(k, short[k % 3][k / 3]))
+                            .collect(),
+                    ),
+                    (Some(long), None) => Some(
+                        (0..layout.bands.len())
+                            .map(|k| band_xmin(k, long.ratio[k]))
+                            .collect(),
+                    ),
+                    (None, None) => self.ath.as_ref().map(|a| a.xmin_all().to_vec()),
                 };
                 let c = match xmin {
-                    Some(xmin) => quantize::outer_loop(&xr, &self.bands, &xmin, budget),
-                    None => CodedGranule::without_scalefactors(quantize::rate_loop(
-                        &xr,
-                        &self.bands,
-                        budget,
-                    )),
+                    Some(xmin) => quantize::outer_loop(&xr, &layout, &xmin, budget),
+                    None => CodedGranule::without_scalefactors(
+                        quantize::rate_loop(&xr, layout.regions, budget),
+                        block == Block::Short,
+                    ),
                 };
                 let q = &c.q;
+                let window = match block {
+                    Block::Normal => Window::Long {
+                        table_select: q.plan.table_select,
+                        region0_count: q.plan.region0_count,
+                        region1_count: q.plan.region1_count,
+                    },
+                    _ => Window::Switched {
+                        block_type: match block {
+                            Block::Start => BlockType::Start,
+                            Block::Short => BlockType::Short,
+                            _ => BlockType::Stop,
+                        },
+                        mixed_block_flag: false,
+                        table_select: [q.plan.table_select[0], q.plan.table_select[1]],
+                        subblock_gain: [0; 3],
+                    },
+                };
                 side.granules[gr][ch] = GranuleInfo {
                     part2_3_length: c.part2_3_length() as u16,
                     big_values: q.plan.big_values,
                     global_gain: q.global_gain,
                     scalefac_compress: c.scalefac_compress.into(),
-                    window: Window::Long {
-                        table_select: q.plan.table_select,
-                        region0_count: q.plan.region0_count,
-                        region1_count: q.plan.region1_count,
-                    },
+                    window,
                     preflag: c.preflag,
                     scalefac_scale: c.scalefac_scale,
                     count1table_select: q.plan.count1_table_b,
@@ -380,14 +466,12 @@ impl Encoder {
         side.write(version, channels, &mut w);
         debug_assert_eq!(w.bit_len(), (4 + self.params.side_info_bytes(channels)) * 8);
         // Main data in syntax order (11172-3 §2.4.1.7): for each granule,
-        // for each channel, scalefactors then Huffman bits. Long blocks with
-        // scfsi = 0: bands 0–10 at slen1 bits, bands 11–20 at slen2 bits.
+        // for each channel, scalefactors then Huffman bits (scfsi = 0).
         for c in &coded {
-            let (slen1, slen2) = quantize::SLEN[usize::from(c.scalefac_compress)];
-            for (b, &v) in c.scalefac.iter().enumerate() {
-                w.put_bits(v.into(), if b < 11 { slen1 } else { slen2 }.into());
+            for (v, bits) in c.scalefactor_fields() {
+                w.put_bits(v.into(), bits.into());
             }
-            huffman::write(&mut w, &c.q.ix, &c.q.plan, &self.bands);
+            huffman::write(&mut w, &c.q.ix, &c.q.plan);
         }
         let mut frame = w.into_bytes();
         debug_assert!(frame.len() <= frame_bytes);
@@ -473,10 +557,70 @@ mod tests {
         let mut config = EncoderConfig::cbr(48_000, 2, 64);
         config.stereo = StereoMode::Mono;
         let mut e = Encoder::new(config).unwrap();
-        let x = [0.25f32; 1152];
+        // One frame plus the encoder's lookahead.
+        let x = [0.25f32; 1152 + 286];
         let mp3 = e.encode(&[&x, &x]).unwrap();
         assert_eq!(mp3.len(), e.stream_params().frame_bytes(false));
         // mode bits = '11' (single channel).
         assert_eq!(mp3[3] >> 6, 0b11);
+    }
+
+    /// Decode with minimp3 and return (gain, SNR dB) against `input` after
+    /// the filterbank delay.
+    fn minimp3_snr(mp3: &[u8], input: &[f32]) -> (f64, f64) {
+        let mut dec = rmp3::Decoder::new(mp3);
+        let mut pcm = Vec::new();
+        while let Some(frame) = dec.next() {
+            if let rmp3::Frame::Audio(a) = frame {
+                pcm.extend(a.samples().iter().map(|&s| f64::from(s) / 32768.0));
+            }
+        }
+        let d = HybridFilterbank::DELAY;
+        let (mut xy, mut xx, mut yy) = (0.0, 0.0, 0.0);
+        for (i, &x) in input.iter().enumerate().skip(2048) {
+            let (x, y) = (f64::from(x), pcm[i + d]);
+            xy += x * y;
+            xx += x * x;
+            yy += y * y;
+        }
+        let g = xy / xx;
+        (
+            g,
+            10.0 * (g * g * xx / (yy - 2.0 * g * xy + g * g * xx)).log10(),
+        )
+    }
+
+    #[test]
+    fn short_blocks_decode_in_minimp3() {
+        // Short blocks reach the decoder intact: reordering, short
+        // scalefactors, implicit regions, and no alias reduction (a
+        // mismatch there would corrupt nearly every granule).
+        let n = 44_100 * 2;
+        let x: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / 44_100.0;
+                0.3 * (2.0 * std::f32::consts::PI * 440.0 * t).sin()
+                    + 0.1 * (2.0 * std::f32::consts::PI * 3_100.0 * t).sin()
+            })
+            .collect();
+        let encode = |force_short: bool| {
+            let mut e = Encoder::new(EncoderConfig::cbr(44_100, 1, 192)).unwrap();
+            e.force_short = force_short;
+            let mut mp3 = e.encode(&[&x]).unwrap();
+            mp3.extend(e.finish().unwrap());
+            mp3
+        };
+        let (g_long, snr_long) = minimp3_snr(&encode(false), &x);
+        let (g_short, snr_short) = minimp3_snr(&encode(true), &x);
+        assert!(
+            (0.95..1.05).contains(&g_long) && (0.95..1.05).contains(&g_short),
+            "gains {g_long} {g_short}"
+        );
+        // Short blocks have coarser frequency resolution, so some loss on a
+        // steady tone is expected, but nowhere near a decoding error.
+        assert!(
+            snr_short > 20.0 && snr_short > snr_long - 15.0,
+            "SNR long {snr_long:.1} dB, short {snr_short:.1} dB"
+        );
     }
 }

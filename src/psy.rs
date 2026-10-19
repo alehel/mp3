@@ -129,12 +129,91 @@ mod tables {
         (44, 48, 0.005, 0.274), (48, 51, 0.726, 0.480), (51, 54, 0.519, 0.261), (54, 56, 0.739, 0.884),
     ];
     
+    /// Table 3-C.7e (44.1 kHz, short blocks): `(FFT lines, qthr, SNR dB, bval)` per partition. The
+    /// table's norm column is not used (it does not match its own spreading function; see `PsyModel::new`).
+    pub const SHORT_PART_44100: [(u16, f32, f32, f32); 39] = [
+        (1, 4.532, -8.240, 0.000), (1, 0.904, -8.240, 1.723), (1, 0.029, -8.240, 3.445),
+        (1, 0.009, -8.240, 5.057), (1, 0.009, -8.240, 6.422), (1, 0.009, -8.240, 7.609),
+        (1, 0.009, -8.240, 8.710), (1, 0.009, -8.240, 9.662), (1, 0.009, -8.240, 10.515),
+        (1, 0.009, -8.240, 11.293), (1, 0.009, -7.447, 12.009), (1, 0.009, -7.447, 12.625),
+        (1, 0.009, -7.447, 13.210), (1, 0.009, -7.447, 13.748), (1, 0.009, -7.447, 14.241),
+        (1, 0.009, -7.447, 14.695), (1, 0.009, -7.447, 15.125), (1, 0.009, -7.447, 15.508),
+        (1, 0.009, -7.447, 15.891), (2, 0.018, -7.447, 16.537), (2, 0.018, -6.990, 17.112),
+        (2, 0.018, -6.990, 17.620), (2, 0.018, -6.990, 18.073), (2, 0.018, -6.990, 18.470),
+        (2, 0.018, -6.990, 18.849), (3, 0.027, -6.990, 19.271), (3, 0.027, -6.990, 19.741),
+        (3, 0.054, -6.990, 20.177), (3, 0.054, -6.990, 20.576), (3, 0.054, -6.990, 20.950),
+        (4, 0.114, -6.020, 21.316), (4, 0.114, -6.020, 21.699), (5, 0.452, -6.020, 22.078),
+        (5, 0.452, -6.020, 22.438), (5, 0.452, -5.229, 22.782), (7, 6.330, -5.229, 23.133),
+        (7, 6.330, -5.229, 23.484), (7, 6.330, -5.229, 23.828), (19, 171.813, -4.559, 24.173),
+    ];
+
+    /// Table 3-C.8e (44.1 kHz, short blocks): `(bu, bo, w1, w2)` per short band.
+    pub const SHORT_CONV_44100: [(u8, u8, f32, f32); 11] = [
+        (0, 3, 1.000, 0.167), (3, 5, 0.833, 0.833), (5, 8, 0.167, 0.500), (8, 11, 0.500, 0.167),
+        (11, 15, 0.833, 0.167), (15, 20, 0.833, 0.250), (20, 23, 0.750, 0.583), (23, 27, 0.417, 0.055),
+        (27, 30, 0.944, 0.375), (30, 33, 0.625, 0.300), (33, 36, 0.700, 0.167),
+    ];
+
+    /// Table 3-C.7d (48 kHz, short blocks): `(FFT lines, qthr, SNR dB, bval)` per partition. The
+    /// table's norm column is not used (it does not match its own spreading function; see `PsyModel::new`).
+    pub const SHORT_PART_48000: [(u16, f32, f32, f32); 38] = [
+        (1, 4.532, -8.240, 0.000), (1, 0.904, -8.240, 1.875), (1, 0.029, -8.240, 3.750),
+        (1, 0.009, -8.240, 5.437), (1, 0.009, -8.240, 6.857), (1, 0.009, -8.240, 8.109),
+        (1, 0.009, -8.240, 9.237), (1, 0.009, -8.240, 10.202), (1, 0.009, -8.240, 11.083),
+        (1, 0.009, -8.240, 11.864), (1, 0.009, -7.447, 12.553), (1, 0.009, -7.447, 13.195),
+        (1, 0.009, -7.447, 13.781), (1, 0.009, -7.447, 14.309), (1, 0.009, -7.447, 14.803),
+        (1, 0.009, -7.447, 15.250), (1, 0.009, -7.447, 15.667), (1, 0.009, -7.447, 16.068),
+        (1, 0.009, -7.447, 16.409), (2, 0.018, -7.447, 17.044), (2, 0.018, -6.990, 17.607),
+        (2, 0.018, -6.990, 18.097), (2, 0.018, -6.990, 18.528), (2, 0.018, -6.990, 18.930),
+        (2, 0.018, -6.990, 19.295), (2, 0.018, -6.990, 19.636), (3, 0.054, -6.990, 20.038),
+        (3, 0.054, -6.990, 20.486), (3, 0.054, -6.990, 20.900), (4, 0.114, -6.990, 21.305),
+        (4, 0.114, -6.020, 21.722), (5, 0.452, -6.020, 22.128), (5, 0.452, -6.020, 22.512),
+        (5, 0.452, -6.020, 22.877), (7, 6.330, -5.229, 23.241), (7, 6.330, -5.229, 23.616),
+        (11, 9.947, -5.229, 23.974), (17, 153.727, -5.229, 24.312),
+    ];
+
+    /// Table 3-C.8d (48 kHz, short blocks): `(bu, bo, w1, w2)` per short band.
+    pub const SHORT_CONV_48000: [(u8, u8, f32, f32); 11] = [
+        (0, 3, 1.000, 0.167), (3, 5, 0.833, 0.833), (5, 8, 0.167, 0.500), (8, 11, 0.500, 0.167),
+        (11, 15, 0.833, 0.167), (15, 19, 0.833, 0.583), (19, 22, 0.417, 0.917), (22, 26, 0.083, 0.944),
+        (26, 30, 0.055, 0.042), (30, 32, 0.958, 0.567), (32, 35, 0.433, 0.167),
+    ];
+
+    /// Table 3-C.7f (32 kHz, short blocks): `(FFT lines, qthr, SNR dB, bval)` per partition. The
+    /// table's norm column is not used (it does not match its own spreading function; see `PsyModel::new`).
+    pub const SHORT_PART_32000: [(u16, f32, f32, f32); 42] = [
+        (1, 4.532, -8.240, 0.000), (1, 0.904, -8.240, 1.250), (1, 0.090, -8.240, 2.500),
+        (1, 0.029, -8.240, 3.750), (1, 0.009, -8.240, 4.909), (1, 0.009, -8.240, 5.958),
+        (1, 0.009, -8.240, 6.857), (1, 0.009, -8.240, 7.700), (1, 0.009, -8.240, 8.500),
+        (1, 0.009, -8.240, 9.237), (1, 0.009, -7.447, 9.895), (1, 0.009, -7.447, 10.500),
+        (1, 0.009, -7.447, 11.083), (1, 0.009, -7.447, 11.604), (1, 0.009, -7.447, 12.107),
+        (1, 0.009, -7.447, 12.554), (1, 0.009, -7.447, 13.000), (1, 0.009, -7.447, 13.391),
+        (1, 0.009, -7.447, 13.781), (2, 0.018, -7.447, 14.474), (2, 0.018, -6.990, 15.096),
+        (2, 0.018, -6.990, 15.667), (2, 0.018, -6.990, 16.177), (2, 0.018, -6.990, 16.636),
+        (2, 0.018, -6.990, 17.057), (2, 0.018, -6.990, 17.429), (2, 0.018, -6.990, 17.786),
+        (3, 0.027, -6.990, 18.177), (3, 0.027, -6.990, 18.597), (3, 0.027, -6.990, 18.994),
+        (3, 0.027, -6.020, 19.352), (3, 0.027, -6.020, 19.693), (4, 0.072, -6.020, 20.066),
+        (4, 0.072, -6.020, 20.461), (4, 0.072, -5.229, 20.841), (5, 0.143, -5.229, 21.201),
+        (5, 0.143, -5.229, 21.549), (6, 0.172, -5.229, 21.911), (7, 0.633, -4.559, 22.275),
+        (7, 0.633, -4.559, 22.625), (8, 0.723, -3.980, 22.971), (10, 9.043, -3.980, 23.321),
+    ];
+
+    /// Table 3-C.8f (32 kHz, short blocks): `(bu, bo, w1, w2)` per short band.
+    pub const SHORT_CONV_32000: [(u8, u8, f32, f32); 11] = [
+        (0, 3, 1.000, 0.167), (3, 5, 0.833, 0.833), (5, 8, 0.167, 0.500), (8, 11, 0.500, 0.167),
+        (11, 15, 0.833, 0.167), (15, 20, 0.833, 0.250), (20, 24, 0.750, 0.250), (24, 29, 0.750, 0.055),
+        (29, 33, 0.944, 0.375), (33, 37, 0.625, 0.472), (37, 40, 0.528, 0.937),
+    ];
+
+
 }
 
 /// A Table 3-C.7 row: `(FFT lines, minval dB, qthr, norm, bval)`.
 type PartitionRow = (u16, f32, f32, f32, f32);
 /// A Table 3-C.8 row: `(bu, bo, w1, w2)`.
 type ConversionRow = (u8, u8, f32, f32);
+/// A short-block Table 3-C.7 row: `(FFT lines, qthr, SNR dB, bval)`.
+type ShortPartitionRow = (u16, f32, f32, f32);
 
 /// Long FFT length (Annex D step 2).
 pub const LONG_FFT: usize = 1024;
@@ -161,6 +240,14 @@ pub const LONG_WINDOW_START: isize = -738;
 pub const SHORT_WINDOW_STARTS: [isize; 3] = [-738, -546, -354];
 /// PCM history the model needs before each granule's first sample.
 pub const HISTORY: usize = 738;
+/// Start offsets of the short-block threshold windows (256), one per short
+/// MDCT window. original derivation as for [`LONG_WINDOW_START`]: short
+/// window j covers subband samples 6+6j .. 17+6j of the 36-sample block,
+/// centred on PCM time 576g − 417.5 + 192j.
+pub const SHORT_THRESHOLD_STARTS: [isize; 3] = [-546, -354, -162];
+/// Perceptual entropy above which a granule is treated as an attack and
+/// coded with short blocks (Annex C.1.5.3, "Window switching decision").
+pub const PE_SWITCH: f32 = 1800.0;
 
 /// Constants of Annex C.1.5.3 §2.1 (Layer III adaptation of model 2).
 const CONV1: f32 = -0.299;
@@ -336,16 +423,42 @@ pub struct PsyModel {
     /// Partition thresholds `nb` of the two previous granules (pre-echo
     /// control).
     nb_prev: [Vec<f32>; 2],
+    /// Short blocks: per partition (first line, lines, qthr, SNR dB, norm).
+    short_parts: Vec<(usize, usize, f32, f32, f32)>,
+    short_spread: Vec<f32>,
+    /// Per short band 0..=12: (partition, weight) pairs.
+    short_band_parts: Vec<Vec<(usize, f32)>>,
 }
 
 impl PsyModel {
     /// Model for an MPEG-1 sample rate; `None` for LSF rates (their tables
     /// are in 13818-3 Annex D; M8).
     pub fn new(sample_rate: u32, bands: &ScalefactorBands) -> Option<Self> {
-        let (part, conv): (&[PartitionRow], &[ConversionRow]) = match sample_rate {
-            44_100 => (&tables::PART_44100, &tables::CONV_44100),
-            48_000 => (&tables::PART_48000, &tables::CONV_48000),
-            32_000 => (&tables::PART_32000, &tables::CONV_32000),
+        type Tables = (
+            &'static [PartitionRow],
+            &'static [ConversionRow],
+            &'static [ShortPartitionRow],
+            &'static [ConversionRow],
+        );
+        let (part, conv, short_part, short_conv): Tables = match sample_rate {
+            44_100 => (
+                &tables::PART_44100,
+                &tables::CONV_44100,
+                &tables::SHORT_PART_44100,
+                &tables::SHORT_CONV_44100,
+            ),
+            48_000 => (
+                &tables::PART_48000,
+                &tables::CONV_48000,
+                &tables::SHORT_PART_48000,
+                &tables::SHORT_CONV_48000,
+            ),
+            32_000 => (
+                &tables::PART_32000,
+                &tables::CONV_32000,
+                &tables::SHORT_PART_32000,
+                &tables::SHORT_CONV_32000,
+            ),
             _ => return None,
         };
         let mut lo = 0;
@@ -397,7 +510,68 @@ impl PsyModel {
             band_parts[band_of(b)].push((b, 1.0));
         }
 
+        // Short blocks (Annex C.1.5.3, "simplified version of the threshold
+        // calculation (constant signal to noise ratio)"). original: norm is
+        // recomputed from the spreading function as Annex D step 6 defines
+        // it, because the short tables' printed norm column repeats the long
+        // tables' values and misses its own spreading function by up to 0.32
+        // (the long tables match to 0.002).
+        let mut lo = 0;
+        let sbval: Vec<f64> = short_part.iter().map(|p| f64::from(p.3)).collect();
+        let ns = short_part.len();
+        let mut short_spread = vec![0.0f32; ns * ns];
+        for b in 0..ns {
+            for bb in 0..ns {
+                short_spread[b * ns + bb] = spreading(sbval[bb], sbval[b]) as f32;
+            }
+        }
+        let short_parts: Vec<_> = short_part
+            .iter()
+            .enumerate()
+            .map(|(b, &(lines, qthr, snr, _))| {
+                let norm = 1.0 / short_spread[b * ns..(b + 1) * ns].iter().sum::<f32>();
+                let p = (lo, usize::from(lines), qthr, snr, norm);
+                lo += usize::from(lines);
+                p
+            })
+            .collect();
+        // Short bands from Table 3-C.8d–f; bands it does not list (11 and
+        // 12) take the remaining partitions by centre frequency, as for long
+        // blocks (256-point FFT line k ↔ short MDCT line 1.5·k).
+        let mut short_band_parts: Vec<Vec<(usize, f32)>> = vec![Vec::new(); 13];
+        for (sb, &(bu, bo, w1, w2)) in short_conv.iter().enumerate() {
+            let (bu, bo) = (usize::from(bu), usize::from(bo));
+            short_band_parts[sb].push((bu, w1));
+            short_band_parts[sb].extend((bu + 1..bo).map(|b| (b, 1.0)));
+            short_band_parts[sb].push((bo, w2));
+        }
+        let (last_bo, last_w2) = short_conv.last().map(|c| (usize::from(c.1), c.3)).unwrap();
+        let first_free = short_conv.len();
+        let mut edges = Vec::with_capacity(14);
+        let mut acc = 0;
+        for &w in bands.short_widths() {
+            edges.push(acc);
+            acc += w;
+        }
+        edges.push(acc);
+        let short_band_of = |b: usize| -> usize {
+            let centre = short_parts[b].0 as f64 + (short_parts[b].1 as f64 - 1.0) / 2.0;
+            let line = centre * 1.5;
+            let band = edges
+                .windows(2)
+                .position(|w| line < w[1] as f64)
+                .unwrap_or(12);
+            band.clamp(first_free, 12)
+        };
+        short_band_parts[short_band_of(last_bo)].push((last_bo, 1.0 - last_w2));
+        for b in last_bo + 1..ns {
+            short_band_parts[short_band_of(b)].push((b, 1.0));
+        }
+
         Some(Self {
+            short_parts,
+            short_spread,
+            short_band_parts,
             parts,
             spread,
             band_parts,
@@ -518,6 +692,46 @@ impl PsyModel {
         }
         PsyResult { ratio, pe }
     }
+
+    /// Short-block thresholds for one granule: per short window (the 256
+    /// samples at [`SHORT_THRESHOLD_STARTS`]), the masking threshold over
+    /// signal energy per short band 0..=12 (Annex C.1.5.3 block diagram
+    /// "calculate threshold for short blocks": `nbb = ecbb · norm ·
+    /// 10^(SNR/10)` with the table's negative SNR, `thr = max(qthr, nbb)`).
+    pub fn analyze_short(&self, windows: [&[f32]; 3]) -> [[f32; 13]; 3] {
+        let ns = self.short_parts.len();
+        windows.map(|block| {
+            assert_eq!(block.len(), SHORT_FFT);
+            let (r, _) = spectrum(&self.fft_short, &self.hann_short, block);
+            let eb: Vec<f32> = self
+                .short_parts
+                .iter()
+                .map(|&(lo, len, ..)| r[lo..(lo + len).min(r.len())].iter().map(|v| v * v).sum())
+                .collect();
+            let thr: Vec<f32> = (0..ns)
+                .map(|b| {
+                    let row = &self.short_spread[b * ns..(b + 1) * ns];
+                    let ecb: f32 = row.iter().zip(&eb).map(|(s, e)| s * e).sum();
+                    let (_, _, qthr, snr, norm) = self.short_parts[b];
+                    (qthr * QTHR_SCALE).max(ecb * norm * 10f32.powf(snr / 10.0))
+                })
+                .collect();
+            let mut ratio = [0.0f32; 13];
+            for (sb, list) in self.short_band_parts.iter().enumerate() {
+                let (en, th) = list.iter().fold((0.0f32, 0.0f32), |(en, th), &(b, w)| {
+                    (en + w * eb[b], th + w * thr[b])
+                });
+                ratio[sb] = if list.is_empty() {
+                    ratio[sb.saturating_sub(1)]
+                } else if en > 0.0 {
+                    th / en
+                } else {
+                    0.0
+                };
+            }
+            ratio
+        })
+    }
 }
 
 #[cfg(test)]
@@ -584,7 +798,7 @@ mod tests {
 
     /// Run the model over a signal granule by granule, as the encoder does.
     fn run(signal: &dyn Fn(isize) -> f32, granules: usize) -> Vec<PsyResult> {
-        let bands = ScalefactorBands::long(44_100).unwrap();
+        let bands = ScalefactorBands::new(44_100).unwrap();
         let mut m = PsyModel::new(44_100, &bands).unwrap();
         (0..granules)
             .map(|g| {

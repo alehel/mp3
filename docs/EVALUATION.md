@@ -47,6 +47,7 @@ Keep `corpus/SOURCES.md` listing every file, its origin and its licence.
 | **Decode validity** | `ffmpeg -v error` | Hard pass/fail: any decoder error fails the run |
 | **Bitrate accuracy** | File size / duration | CBR must hit the target exactly; VBR is reported |
 | **Segmental SNR** | Built in | Sanity check only, not perceptual. Useful for catching bugs in M2–M4 |
+| **Pre-echo** (dB, lower is better) | Built in (`pre_echo_db` in the results JSON) | Coding noise in the 10 ms before each detected attack relative to the attack's energy. Added in M6 because ViSQOL barely registers pre-echo |
 
 MP3 encoders and decoders add delay (encoder delay plus decoder delay, often
 around 1105 samples total, but it depends). Decoders like ffmpeg trim it

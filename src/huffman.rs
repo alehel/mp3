@@ -19,7 +19,7 @@
 mod tables;
 
 use crate::bitstream::BitWriter;
-use crate::quantize::{GRANULE_LINES, ScalefactorBands};
+use crate::quantize::GRANULE_LINES;
 
 /// Largest magnitude allowed in the big_values region (13818-3 §2.5.2,
 /// `big_values` semantics).
@@ -144,14 +144,30 @@ fn quad_bits(table_b: bool, q: &[i32]) -> u32 {
     u32::from(quad_table(table_b)[quad_index(q)].0) + q.iter().filter(|&&v| v != 0).count() as u32
 }
 
+/// How the big_values region is split into Huffman regions.
+#[derive(Debug, Clone, Copy)]
+pub enum Regions<'a> {
+    /// Non-switched long blocks: region0/region1 counts are transmitted, so
+    /// search them; the slice is the band boundaries they count (start of
+    /// each band, then 576).
+    Search(&'a [usize]),
+    /// Window-switched granules: the counts are implicit (13818-3 §2.5.2,
+    /// "region0_count = 7 ... = 8 ... region1_count = 36"), giving a fixed
+    /// region-1 start (in coded order) and no region 2.
+    Fixed(usize),
+}
+
 /// Everything the side information needs to describe a granule's Huffman
-/// data (long blocks).
+/// data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HuffmanPlan {
     pub big_values: u16,
     pub table_select: [u8; 3],
+    /// Transmitted only for non-switched granules.
     pub region0_count: u8,
     pub region1_count: u8,
+    /// Where regions 1 and 2 start, clipped to the big_values end.
+    pub region_starts: [u16; 2],
     pub count1_table_b: bool,
     /// Number of count1 quadruples (implicit in the bitstream).
     pub count1: u16,
@@ -202,9 +218,10 @@ fn best_table(
 /// [`MAX_BIG_VALUE`].
 ///
 /// original: the region split is "up to the implementation" (Annex C.1.5.4
-/// §4.6). We search every `region0_count` (0..=15) and `region1_count`
-/// (0..=7), using per-table prefix sums so each candidate costs O(tables).
-pub fn plan(ix: &[i32; GRANULE_LINES], bands: &ScalefactorBands) -> HuffmanPlan {
+/// §4.6). For [`Regions::Search`] we try every `region0_count` (0..=15) and
+/// `region1_count` (0..=7), using per-table prefix sums so each candidate
+/// costs O(tables).
+pub fn plan(ix: &[i32; GRANULE_LINES], regions: Regions) -> HuffmanPlan {
     let (big_values, count1) = partition(ix);
     let bv_end = 2 * big_values;
 
@@ -231,8 +248,32 @@ pub fn plan(ix: &[i32; GRANULE_LINES], bands: &ScalefactorBands) -> HuffmanPlan 
         })
         .collect();
 
+    let max_in = |lo: usize, hi: usize| {
+        ix[lo..hi]
+            .iter()
+            .map(|v| v.unsigned_abs())
+            .max()
+            .unwrap_or(0)
+    };
+    let bounds = match regions {
+        Regions::Fixed(start) => {
+            let s1 = start.min(bv_end);
+            let (t0, b0) = best_table(max_in(0, s1), 0..s1 / 2, &prefix);
+            let (t1, b1) = best_table(max_in(s1, bv_end), s1 / 2..big_values, &prefix);
+            let mut plan = HuffmanPlan {
+                big_values: big_values as u16,
+                table_select: [t0, t1, 0],
+                region_starts: [s1 as u16, bv_end as u16],
+                count1: count1 as u16,
+                bits: b0 + b1,
+                ..HuffmanPlan::default()
+            };
+            add_count1(ix, bv_end, count1, &mut plan);
+            return plan;
+        }
+        Regions::Search(bounds) => bounds,
+    };
     // Maximum magnitude per scalefactor band, clipped to the big_values end.
-    let bounds = bands.region_bounds();
     let band_max: Vec<u32> = bounds
         .windows(2)
         .map(|b| {
@@ -272,6 +313,7 @@ pub fn plan(ix: &[i32; GRANULE_LINES], bands: &ScalefactorBands) -> HuffmanPlan 
                     table_select,
                     region0_count: r0 as u8,
                     region1_count: r1 as u8,
+                    region_starts: [s1 as u16, s2 as u16],
                     count1_table_b: false,
                     count1: count1 as u16,
                     bits,
@@ -284,32 +326,26 @@ pub fn plan(ix: &[i32; GRANULE_LINES], bands: &ScalefactorBands) -> HuffmanPlan 
         }
     }
     let mut plan = best.expect("at least one candidate");
+    add_count1(ix, bv_end, count1, &mut plan);
+    plan
+}
 
-    // count1 region: pick table A or B, whichever is shorter (Annex C.1.5.4
-    // §4.5).
+/// count1 region: pick table A or B, whichever is shorter (Annex C.1.5.4
+/// §4.5), and add its bits.
+fn add_count1(ix: &[i32; GRANULE_LINES], bv_end: usize, count1: usize, plan: &mut HuffmanPlan) {
     let quads = &ix[bv_end..bv_end + 4 * count1];
     let bits_a: u32 = quads.chunks_exact(4).map(|q| quad_bits(false, q)).sum();
     let bits_b: u32 = quads.chunks_exact(4).map(|q| quad_bits(true, q)).sum();
     plan.count1_table_b = bits_b < bits_a;
     plan.bits += bits_a.min(bits_b);
-    plan
 }
 
-/// Write the Huffman data for a granule (13818-3 §2.5.1 `huffmancodebits()`,
-/// long blocks: increasing frequency). Writes exactly `plan.bits` bits.
-pub fn write(
-    w: &mut BitWriter,
-    ix: &[i32; GRANULE_LINES],
-    plan: &HuffmanPlan,
-    bands: &ScalefactorBands,
-) {
-    let bounds = bands.region_bounds();
+/// Write the Huffman data for a granule (13818-3 §2.5.1 `huffmancodebits()`)
+/// with `ix` in coded order (long blocks: increasing frequency; short
+/// blocks: band, window, frequency). Writes exactly `plan.bits` bits.
+pub fn write(w: &mut BitWriter, ix: &[i32; GRANULE_LINES], plan: &HuffmanPlan) {
     let bv_end = 2 * usize::from(plan.big_values);
-    let last = bounds.len() - 1;
-    let s1 = bounds[(usize::from(plan.region0_count) + 1).min(last)].min(bv_end);
-    let s2 = bounds
-        [(usize::from(plan.region0_count) + usize::from(plan.region1_count) + 2).min(last)]
-    .min(bv_end);
+    let [s1, s2] = plan.region_starts.map(usize::from);
     for (k, (lo, hi)) in [(0, s1), (s1, s2), (s2, bv_end)].into_iter().enumerate() {
         if lo == hi {
             continue;
@@ -405,10 +441,10 @@ mod tests {
     /// only the side-info fields and the bits), and compare.
     fn round_trip(ix: &[i32; GRANULE_LINES], rate: u32) {
         use crate::refdec::{BitReader, HuffmanSideInfo, decode_huffman};
-        let bands = ScalefactorBands::long(rate).unwrap();
-        let p = plan(ix, &bands);
+        let bands = crate::quantize::ScalefactorBands::new(rate).unwrap();
+        let p = plan(ix, Regions::Search(bands.region_bounds()));
         let mut w = BitWriter::new();
-        write(&mut w, ix, &p, &bands);
+        write(&mut w, ix, &p);
         assert_eq!(
             w.bit_len(),
             p.bits as usize,
@@ -464,5 +500,55 @@ mod tests {
         let mut ix = [0; GRANULE_LINES];
         ix[575] = -(MAX_BIG_VALUE as i32);
         round_trip(&ix, 48_000);
+    }
+
+    #[test]
+    fn switched_granules_round_trip_with_implicit_regions() {
+        use crate::mdct::Block;
+        use crate::refdec::{BitReader, HuffmanSideInfo, decode_huffman};
+        let bands = crate::quantize::ScalefactorBands::new(44_100).unwrap();
+        let mut seed = 9u64;
+        let mut rand = |n: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        for (block, r0) in [(Block::Start, 7), (Block::Stop, 7), (Block::Short, 8)] {
+            let layout = bands.layout(block);
+            // The decoder counts region0_count over long bands, or over
+            // short (band, window) pairs for short blocks.
+            let decoder_bounds: Vec<usize> =
+                layout.bands.iter().map(|b| b.0).chain([576]).collect();
+            for _ in 0..10 {
+                let mut ix = [0i32; GRANULE_LINES];
+                let len = 40 + rand(500) as usize;
+                for v in &mut ix[..len] {
+                    let mag = rand(20) as i32;
+                    *v = if rand(2) == 0 { mag } else { -mag };
+                }
+                let p = plan(&ix, layout.regions);
+                let mut w = BitWriter::new();
+                write(&mut w, &ix, &p);
+                assert_eq!(w.bit_len(), p.bits as usize);
+                let bytes = w.into_bytes();
+                let si = HuffmanSideInfo {
+                    big_values: p.big_values.into(),
+                    table_select: p.table_select.map(usize::from),
+                    region0_count: r0,
+                    region1_count: 36,
+                    count1_table_b: p.count1_table_b,
+                    part3_length: p.bits as usize,
+                };
+                let decoded = decode_huffman(
+                    &mut BitReader::new(&bytes),
+                    &si,
+                    &decoder_bounds,
+                    |t| PairTable::get(t).unwrap().raw(),
+                    quad_table(si.count1_table_b),
+                );
+                assert_eq!(&decoded[..], &ix[..], "{block:?}");
+            }
+        }
     }
 }
